@@ -1,0 +1,129 @@
+version: '3.8'
+
+services:
+  # Nginx Reverse Proxy & Load Balancer
+  nginx:
+    image: nginx:alpine
+    container_name: ledgerflow_load_balancer
+    restart: always
+    ports:
+      - "4000:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      app1:
+        condition: service_healthy
+      app2:
+        condition: service_healthy
+      app3:
+        condition: service_healthy
+    networks:
+      - ledgerflow_network
+
+  # Application Server 1
+  app1:
+    build: .
+    container_name: ledgerflow_app_server_1
+    restart: always
+    environment:
+      - PORT=4001
+      - INSTANCE_ID=server-1
+      - DATABASE_URL=postgresql://ledger:secret@postgres:5432/ledgerflow
+      - REDIS_URL=redis://redis:6379
+      - JWT_SECRET=ledgerflow-ultra-production-secret-server1
+    ports:
+      - "4001:4001"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:4001/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    depends_on:
+      - postgres
+      - redis
+    networks:
+      - ledgerflow_network
+
+  # Application Server 2
+  app2:
+    build: .
+    container_name: ledgerflow_app_server_2
+    restart: always
+    environment:
+      - PORT=4002
+      - INSTANCE_ID=server-2
+      - DATABASE_URL=postgresql://ledger:secret@postgres:5432/ledgerflow
+      - REDIS_URL=redis://redis:6379
+      - JWT_SECRET=ledgerflow-ultra-production-secret-server2
+    ports:
+      - "4002:4002"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:4002/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    depends_on:
+      - postgres
+      - redis
+    networks:
+      - ledgerflow_network
+
+  # Application Server 3
+  app3:
+    build: .
+    container_name: ledgerflow_app_server_3
+    restart: always
+    environment:
+      - PORT=4003
+      - INSTANCE_ID=server-3
+      - DATABASE_URL=postgresql://ledger:secret@postgres:5432/ledgerflow
+      - REDIS_URL=redis://redis:6379
+      - JWT_SECRET=ledgerflow-ultra-production-secret-server3
+    ports:
+      - "4003:4003"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:4003/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    depends_on:
+      - postgres
+      - redis
+    networks:
+      - ledgerflow_network
+
+  # PostgreSQL 16 Relational Database
+  postgres:
+    image: postgres:16-alpine
+    container_name: ledgerflow_postgres_db
+    restart: always
+    environment:
+      POSTGRES_USER: ledger
+      POSTGRES_PASSWORD: secret
+      POSTGRES_DB: ledgerflow
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - ledgerflow_network
+
+  # Redis 7 Distributed Cache & Shared Rate Limiter
+  redis:
+    image: redis:7-alpine
+    container_name: ledgerflow_redis_cache
+    restart: always
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    networks:
+      - ledgerflow_network
+
+volumes:
+  pgdata:
+  redisdata:
+
+networks:
+  ledgerflow_network:
+    driver: bridge

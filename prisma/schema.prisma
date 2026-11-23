@@ -1,0 +1,320 @@
+// LedgerFlow Enterprise Multi-Tenant SaaS - Prisma Database Schema
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+enum GlobalRole {
+  SUPER_ADMIN
+  ADMIN
+  USER
+}
+
+enum TenantRole {
+  OWNER
+  ADMIN
+  MEMBER
+  VIEWER
+}
+
+enum TransactionType {
+  INCOME
+  EXPENSE
+  TRANSFER
+}
+
+enum AccountType {
+  BANK_ACCOUNT
+  WALLET
+  CREDIT_CARD
+  CASH
+  INVESTMENT
+  OTHER
+}
+
+enum NotificationLevel {
+  INFO
+  SUCCESS
+  WARNING
+  CRITICAL
+}
+
+model User {
+  id                  String             @id @default(uuid())
+  email               String             @unique
+  passwordHash        String
+  name                String
+  avatarUrl           String?
+  globalRole          GlobalRole         @default(USER)
+  isEmailVerified     Boolean            @default(false)
+  emailReportsEnabled Boolean            @default(true)
+  currency            String             @default("INR")
+  createdAt           DateTime           @default(now())
+  updatedAt           DateTime           @updatedAt
+
+  memberships         Membership[]
+  accounts            Account[]
+  transactions        Transaction[]
+  budgets             Budget[]
+  goals               SavingsGoal[]
+  recurring           RecurringRule[]
+  monthlyReports      MonthlyReport[]
+  notifications       Notification[]
+  sessions            UserSession[]
+  refreshTokens       RefreshToken[]
+  auditLogs           AuditLog[]
+  resetTokens         PasswordResetToken[]
+  verificationTokens  EmailVerificationToken[]
+
+  @@index([email])
+}
+
+model Organization {
+  id          String       @id @default(uuid())
+  name        String
+  slug        String       @unique
+  plan        String       @default("ENTERPRISE_FREE")
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+
+  memberships Membership[]
+  accounts    Account[]
+  transactions Transaction[]
+  budgets     Budget[]
+  goals       SavingsGoal[]
+  recurring   RecurringRule[]
+  reports     MonthlyReport[]
+  auditLogs   AuditLog[]
+
+  @@index([slug])
+}
+
+model Membership {
+  id          String       @id @default(uuid())
+  userId      String
+  orgId       String
+  role        TenantRole   @default(MEMBER)
+  permissions String[]     @default([])
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+
+  user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  organization Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, orgId])
+  @@index([userId])
+  @@index([orgId])
+}
+
+model Account {
+  id           String        @id @default(uuid())
+  orgId        String
+  userId       String
+  name         String
+  type         AccountType   @default(BANK_ACCOUNT)
+  openingPaise BigInt        @default(0)
+  color        String        @default("#101114")
+  isArchived   Boolean       @default(false)
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+
+  organization Organization  @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  user         User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  transactions Transaction[] @relation("AccountTransactions")
+  transfersIn  Transaction[] @relation("TransferToAccount")
+
+  @@index([orgId, userId])
+}
+
+model Transaction {
+  id           String          @id @default(uuid())
+  orgId        String
+  userId       String
+  accountId    String
+  toAccountId  String?
+  type         TransactionType
+  title        String
+  amountPaise  BigInt
+  category     String
+  subcategory  String?
+  method       String          @default("UPI")
+  date         String          // ISO format YYYY-MM-DD
+  notes        String?
+  tags         String[]        @default([])
+  receiptUrl   String?
+  createdAt    DateTime        @default(now())
+  updatedAt    DateTime        @updatedAt
+
+  organization Organization    @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  user         User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  account      Account         @relation("AccountTransactions", fields: [accountId], references: [id], onDelete: Cascade)
+  toAccount    Account?        @relation("TransferToAccount", fields: [toAccountId], references: [id], onDelete: SetNull)
+
+  @@index([orgId, date])
+  @@index([userId, date])
+  @@index([orgId, category])
+}
+
+model Budget {
+  id              String       @id @default(uuid())
+  orgId           String
+  userId          String
+  monthKey        String       // YYYY-MM
+  overallPaise    BigInt       @default(0)
+  categoryBudgets Json         @default("{}") // { [category]: paise }
+  createdAt       DateTime     @default(now())
+  updatedAt       DateTime     @updatedAt
+
+  organization    Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  user            User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([orgId, userId, monthKey])
+  @@index([orgId, monthKey])
+}
+
+model SavingsGoal {
+  id           String       @id @default(uuid())
+  orgId        String
+  userId       String
+  name         String
+  targetPaise  BigInt
+  currentPaise BigInt       @default(0)
+  deadline     String       // YYYY-MM-DD
+  color        String       @default("#16A579")
+  isCompleted  Boolean      @default(false)
+  createdAt    DateTime     @default(now())
+  updatedAt    DateTime     @updatedAt
+
+  organization Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([orgId, userId])
+}
+
+model RecurringRule {
+  id           String          @id @default(uuid())
+  orgId        String
+  userId       String
+  accountId    String
+  title        String
+  type         TransactionType
+  amountPaise  BigInt
+  category     String
+  frequency    String          @default("Monthly") // Daily, Weekly, Monthly, Yearly
+  nextDate     String          // YYYY-MM-DD
+  active       Boolean         @default(true)
+  createdAt    DateTime        @default(now())
+  updatedAt    DateTime        @updatedAt
+
+  organization Organization    @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  user         User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([orgId, userId])
+}
+
+model MonthlyReport {
+  id                 String       @id @default(uuid())
+  orgId              String
+  userId             String
+  monthKey           String       // YYYY-MM
+  openingPaise       BigInt       @default(0)
+  incomePaise        BigInt       @default(0)
+  expensePaise       BigInt       @default(0)
+  closingPaise       BigInt       @default(0)
+  savingsRatePct     Float        @default(0.0)
+  categoryBreakdown  Json         @default("{}")
+  summaryText        String?
+  emailSent          Boolean      @default(false)
+  emailSentAt        DateTime?
+  createdAt          DateTime     @default(now())
+  updatedAt          DateTime     @updatedAt
+
+  organization       Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  user               User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([orgId, userId, monthKey])
+  @@index([orgId, monthKey])
+}
+
+model Notification {
+  id        String            @id @default(uuid())
+  userId    String
+  title     String
+  message   String
+  level     NotificationLevel @default(INFO)
+  read      Boolean           @default(false)
+  createdAt DateTime          @default(now())
+
+  user      User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, read])
+}
+
+model UserSession {
+  id        String   @id @default(uuid())
+  userId    String
+  token     String   @unique
+  userAgent String?
+  ipAddress String?
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([token])
+  @@index([userId])
+}
+
+model RefreshToken {
+  id        String   @id @default(uuid())
+  userId    String
+  tokenHash String   @unique
+  revoked   Boolean  @default(false)
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([tokenHash])
+}
+
+model AuditLog {
+  id        String        @id @default(uuid())
+  orgId     String?
+  userId    String?
+  action    String
+  details   Json?
+  ipAddress String?
+  userAgent String?
+  createdAt DateTime      @default(now())
+
+  organization Organization? @relation(fields: [orgId], references: [id], onDelete: SetNull)
+  user         User?         @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([orgId, createdAt])
+  @@index([userId, createdAt])
+}
+
+model PasswordResetToken {
+  id        String   @id @default(uuid())
+  userId    String
+  tokenHash String   @unique
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model EmailVerificationToken {
+  id        String   @id @default(uuid())
+  userId    String
+  tokenHash String   @unique
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
