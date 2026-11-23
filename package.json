@@ -2,7 +2,6 @@
   "name": "ledgerflow-enterprise-saas",
   "version": "2.0.0",
   "description": "Production-Ready Multi-Tenant FinTech Expense Tracker & SaaS Platform with 3-Server Load Balanced Architecture",
-  "main": "dist/server.js",
   "type": "commonjs",
   "scripts": {
     "dev": "tsx watch src/server.ts",

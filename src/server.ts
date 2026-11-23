@@ -3,8 +3,9 @@ import { config } from './config';
 
 const app = createApp();
 
-const server = app.listen(config.port, () => {
-  console.log(`
+if (process.env.VERCEL !== '1' && process.env.NODE_ENV !== 'test') {
+  const server = app.listen(config.port, () => {
+    console.log(`
   ==============================================================
   🚀 LEDGERFLOW ENTERPRISE SAAS SERVER RUNNING
   ==============================================================
@@ -14,13 +15,16 @@ const server = app.listen(config.port, () => {
   Health Check: http://localhost:${config.port}/health
   Static UI   : http://localhost:${config.port}/index.html
   ==============================================================
-  `);
-});
-
-process.on('SIGTERM', () => {
-  console.log('SIGTERM signal received: closing HTTP server gracefully...');
-  server.close(() => {
-    console.log('HTTP server closed.');
-    process.exit(0);
+    `);
   });
-});
+
+  process.on('SIGTERM', () => {
+    console.log('SIGTERM signal received: closing HTTP server gracefully...');
+    server.close(() => {
+      console.log('HTTP server closed.');
+      process.exit(0);
+    });
+  });
+}
+
+export default app;

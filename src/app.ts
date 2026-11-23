@@ -63,6 +63,8 @@ export function createApp(customInstanceId?: string): Express {
   };
   app.get('/health', healthHandler);
   app.get('/api/health', healthHandler);
+  app.get('/api', healthHandler);
+  app.get('/api/index', healthHandler);
 
   // 6. Authentication Routes
   app.post('/api/auth/register', authLimiter, AuthController.register);
