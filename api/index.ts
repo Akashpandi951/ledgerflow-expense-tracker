@@ -2,4 +2,4 @@ import { createApp } from '../src/app';
 
 const app = createApp('vercel-serverless');
 
-export default app;
+export = Object.assign(app, { default: app });
