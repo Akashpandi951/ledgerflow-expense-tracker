@@ -3,6 +3,7 @@ import cors from 'cors';
 import helmet from 'helmet';
 import morgan from 'morgan';
 import path from 'path';
+import fs from 'fs';
 
 import { config } from './config';
 import { AuthController } from './controllers/authController';
@@ -91,12 +92,25 @@ export function createApp(customInstanceId?: string): Express {
   app.get('/api/admin/audit-logs', authMiddleware, requireGlobalRole('SUPER_ADMIN'), AdminController.getAuditLogs);
 
   // 11. Static Client UI Serving
-  const clientPath = path.resolve(__dirname, '../ledgerflow_expense_tracker/modular');
-  app.use(express.static(clientPath));
-  app.use('/modular', express.static(clientPath));
+  const possiblePaths = [
+    path.resolve(__dirname, '../public'),
+    path.resolve(__dirname, '../ledgerflow_expense_tracker/modular'),
+    path.resolve(__dirname, './public')
+  ];
+  const clientPath = possiblePaths.find(p => fs.existsSync(path.join(p, 'index.html'))) || possiblePaths[0];
+
+  if (fs.existsSync(clientPath)) {
+    app.use(express.static(clientPath));
+    app.use('/modular', express.static(clientPath));
+  }
 
   app.get('/', (req, res) => {
-    res.sendFile(path.join(clientPath, 'index.html'));
+    const indexPath = path.join(clientPath, 'index.html');
+    if (fs.existsSync(indexPath)) {
+      res.sendFile(indexPath);
+    } else {
+      res.status(200).json({ status: 'UP', message: 'LedgerFlow API Serverless Running' });
+    }
   });
 
   // 12. Centralized Exception Handling

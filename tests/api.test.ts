@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import request from 'supertest';
 import { createApp } from '../src/app';
+import vercelHandler from '../api';
 
 const app = createApp();
 
@@ -79,5 +80,12 @@ describe('Enterprise API Endpoints & Financial Calculations', () => {
     expect(res.body.success).toBe(true);
     expect(res.body.recipient).toBe('alex@ledgerflow.app');
     expect(res.body.report.emailSent).toBe(true);
+  });
+
+  it('verifies Vercel serverless handler (api/index.ts) properly routes health check and telemetry', async () => {
+    const res = await request(vercelHandler).get('/health');
+    expect(res.status).toBe(200);
+    expect(res.body.status).toBe('UP');
+    expect(res.body.instanceId).toBe('vercel-serverless');
   });
 });
