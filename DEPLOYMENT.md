@@ -56,3 +56,25 @@ docker compose logs -f nginx app1 app2 app3
 | `REDIS_URL` | Redis cache and distributed rate limiter | `redis://redis:6379` |
 | `JWT_SECRET` | 64-byte cryptographic secret | `...` |
 | `SMTP_HOST` | Outgoing email mail server | `smtp.mailgun.org` |
+
+---
+
+## 4. Vercel Cloud Serverless Deployment
+
+LedgerFlow includes native support for Vercel Serverless Functions and Edge CDN static asset delivery.
+
+### How It Works on Vercel
+1. **Static UI (`public/`)**: The luxury glassmorphism frontend (`index.html`, `styles.css`, `app.js`) is served directly from Vercel's global edge network at the root `/`.
+2. **Serverless API (`api/index.ts`)**: Express API routes and `/health` telemetry run on demand inside Vercel's Node.js Serverless runtime without requiring long-lived socket listeners.
+3. **Routing (`vercel.json`)**: Automatic URL rewrites direct `/api/*` and `/health` requests to the serverless function handler, preserving seamless client-to-backend communication.
+
+### Deploying to Vercel
+1. Push to your GitHub repository:
+   ```bash
+   git push origin main
+   ```
+2. Connect the repository in your [Vercel Dashboard](https://vercel.com/new).
+3. Framework Preset: Leave as **Other** (detected automatically via `vercel.json`).
+4. Build Command: `npm run build` (or left default).
+5. Output Directory: Left default (Vercel automatically serves `public/`).
+6. Click **Deploy**. Vercel will build and deploy both the static frontend and serverless API in seconds.
