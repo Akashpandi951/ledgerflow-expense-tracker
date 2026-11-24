@@ -95,6 +95,9 @@ export function createApp(customInstanceId?: string): Express {
 
   // 11. Static Client UI Serving
   const possiblePaths = [
+    path.resolve(process.cwd(), 'public'),
+    path.resolve(process.cwd(), 'dist'),
+    process.cwd(),
     path.resolve(__dirname, '../public'),
     path.resolve(__dirname, '../ledgerflow_expense_tracker/modular'),
     path.resolve(__dirname, './public')
@@ -109,9 +112,13 @@ export function createApp(customInstanceId?: string): Express {
   app.get('/', (req, res) => {
     const indexPath = path.join(clientPath, 'index.html');
     if (fs.existsSync(indexPath)) {
-      res.sendFile(indexPath);
+      res.sendFile(indexPath, (err) => {
+        if (err && !res.headersSent) {
+          res.status(200).json({ status: 'UP', message: 'LedgerFlow API Serverless Active' });
+        }
+      });
     } else {
-      res.status(200).json({ status: 'UP', message: 'LedgerFlow API Serverless Running' });
+      res.status(200).json({ status: 'UP', message: 'LedgerFlow API Serverless Active' });
     }
   });
 

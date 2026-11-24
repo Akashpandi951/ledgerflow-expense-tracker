@@ -9,7 +9,7 @@ const clientBuckets = new Map<string, RateLimitBucket>();
 
 export function rateLimiter(options: { maxRequests: number; windowMs: number; message?: string }) {
   return (req: Request, res: Response, next: NextFunction): void => {
-    const ip = req.ip || req.socket.remoteAddress || 'unknown';
+    const ip = (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() || req.ip || req.socket?.remoteAddress || 'unknown';
     const key = `${req.path}:${ip}`;
     const now = Date.now();
 
