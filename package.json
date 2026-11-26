@@ -5,10 +5,11 @@
   "type": "commonjs",
   "scripts": {
     "dev": "tsx watch src/server.ts",
-    "build": "tsc && node -e \"const fs=require('fs'); if(!fs.existsSync('dist')){fs.mkdirSync('dist',{recursive:true});} ['index.html','styles.css','app.js'].forEach(f=>{if(fs.existsSync('public/'+f))fs.copyFileSync('public/'+f,'dist/'+f);});\"",
-    "vercel-build": "tsc && node -e \"const fs=require('fs'); if(!fs.existsSync('dist')){fs.mkdirSync('dist',{recursive:true});} ['index.html','styles.css','app.js'].forEach(f=>{if(fs.existsSync('public/'+f))fs.copyFileSync('public/'+f,'dist/'+f);});\"",
+    "build": "tsc && node -e \"const fs=require('fs'); if(!fs.existsSync('dist')){fs.mkdirSync('dist',{recursive:true});} ['index.html','styles.css','app.js','liquid-effects.js'].forEach(f=>{if(fs.existsSync('public/'+f))fs.copyFileSync('public/'+f,'dist/'+f);});\"",
+    "vercel-build": "tsc && node -e \"const fs=require('fs'); if(!fs.existsSync('dist')){fs.mkdirSync('dist',{recursive:true});} ['index.html','styles.css','app.js','liquid-effects.js'].forEach(f=>{if(fs.existsSync('public/'+f))fs.copyFileSync('public/'+f,'dist/'+f);});\"",
     "start": "tsx src/server.ts",
     "start:cluster": "tsx src/cluster.ts",
+    "bench:load": "tsx scripts/load-benchmark.ts",
     "mcp": "tsx src/mcp/index.ts",
     "test": "vitest run",
     "test:watch": "vitest",

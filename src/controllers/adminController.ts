@@ -2,6 +2,8 @@ import { Request, Response } from 'express';
 import { store } from '../db/store';
 import { sanitizeUser } from '../utils/security';
 import { config } from '../config';
+import { cacheService } from '../services/cacheService';
+import { jobQueue } from '../services/jobQueue';
 
 export class AdminController {
   public static async getUsers(req: Request, res: Response): Promise<void> {
@@ -32,6 +34,8 @@ export class AdminController {
         totalTransactions,
         totalAuditLogs,
         aggregateVolumePaise,
+        cache: cacheService.stats(),
+        jobQueue: jobQueue.stats(),
         memory: {
           heapUsedMb: Math.round(memoryUsage.heapUsed / 1024 / 1024 * 100) / 100,
           heapTotalMb: Math.round(memoryUsage.heapTotal / 1024 / 1024 * 100) / 100,

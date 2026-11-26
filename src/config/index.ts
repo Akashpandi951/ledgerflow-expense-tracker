@@ -18,7 +18,10 @@ export const config = {
     from: process.env.SMTP_FROM || 'LedgerFlow Reports <reports@ledgerflow.app>',
   },
   cluster: {
-    ports: [4001, 4002, 4003],
-    lbPort: 4000,
+    ports: (process.env.CLUSTER_PORTS || '4001,4002,4003')
+      .split(',')
+      .map((p) => parseInt(p.trim(), 10))
+      .filter((p) => Number.isFinite(p) && p > 0),
+    lbPort: parseInt(process.env.CLUSTER_LB_PORT || '4000', 10),
   }
 };

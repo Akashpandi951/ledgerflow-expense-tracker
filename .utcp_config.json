@@ -1,0 +1,23 @@
+{
+  "load_variables_from": [
+    {
+      "variable_loader_type": "dotenv",
+      "env_file_path": ".env"
+    }
+  ],
+  "tool_repository": {
+    "tool_repository_type": "in_memory"
+  },
+  "tool_search_strategy": {
+    "tool_search_strategy_type": "tag_and_description_word_match"
+  },
+  "manual_call_templates": [
+    {
+      "name": "ledgerflow",
+      "call_template_type": "http",
+      "http_method": "GET",
+      "url": "http://127.0.0.1:4000/utcp-manual.json",
+      "content_type": "application/json"
+    }
+  ]
+}

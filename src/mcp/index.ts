@@ -8,6 +8,7 @@ import {
 import http from 'http';
 import { store } from '../db/store';
 import { ReportService } from '../services/reportService';
+import { getUtcpManual } from '../protocols/utcp';
 
 const API_BASE = process.env.LEDGERFLOW_API_URL || 'http://127.0.0.1:4000';
 
@@ -169,6 +170,14 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           properties: {
             monthKey: { type: 'string', description: 'Month in YYYY-MM format (defaults to current month)' },
           },
+        },
+      },
+      {
+        name: 'ledgerflow_utcp_discover',
+        description: 'Return the UTCP v1.0.1 manual with HTTP call templates for direct zero-middleware tool invocation.',
+        inputSchema: {
+          type: 'object',
+          properties: {},
         },
       },
     ],
@@ -430,6 +439,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           content: [{
             type: 'text',
             text: `📧 ${result.message}\nRecipient: ${result.recipient}\nStatus: DELIVERED\nTimestamp: ${result.report.emailSentAt}`,
+          }],
+        };
+      }
+
+      case 'ledgerflow_utcp_discover': {
+        const manual = getUtcpManual(API_BASE);
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify(manual, null, 2),
           }],
         };
       }

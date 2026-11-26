@@ -1,6 +1,8 @@
 node_modules/
 dist/
 .playwright-mcp/
+.taste-skill/
+.vercel/
 .env
 .DS_Store
 *.log

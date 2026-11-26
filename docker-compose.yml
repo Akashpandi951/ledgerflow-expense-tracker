@@ -1,7 +1,7 @@
 version: '3.8'
 
 services:
-  # Nginx Reverse Proxy & Load Balancer
+  # Nginx Reverse Proxy & Least-Conn Load Balancer
   nginx:
     image: nginx:alpine
     container_name: ledgerflow_load_balancer
@@ -17,20 +17,23 @@ services:
         condition: service_healthy
       app3:
         condition: service_healthy
+      app4:
+        condition: service_healthy
     networks:
       - ledgerflow_network
 
-  # Application Server 1
+  # Horizontal Stateless App Nodes (All share identical JWT_SECRET for cross-node token validation)
   app1:
     build: .
     container_name: ledgerflow_app_server_1
     restart: always
     environment:
+      - NODE_ENV=production
       - PORT=4001
       - INSTANCE_ID=server-1
-      - DATABASE_URL=postgresql://ledger:secret@postgres:5432/ledgerflow
+      - DATABASE_URL=postgresql://ledger:secret@pgbouncer:6432/ledgerflow?pgbouncer=true&connection_limit=25
       - REDIS_URL=redis://redis:6379
-      - JWT_SECRET=ledgerflow-ultra-production-secret-server1
+      - JWT_SECRET=${JWT_SECRET:-ledgerflow-shared-cluster-jwt-secret-2026}
     ports:
       - "4001:4001"
     healthcheck:
@@ -39,22 +42,22 @@ services:
       timeout: 5s
       retries: 3
     depends_on:
-      - postgres
+      - pgbouncer
       - redis
     networks:
       - ledgerflow_network
 
-  # Application Server 2
   app2:
     build: .
     container_name: ledgerflow_app_server_2
     restart: always
     environment:
+      - NODE_ENV=production
       - PORT=4002
       - INSTANCE_ID=server-2
-      - DATABASE_URL=postgresql://ledger:secret@postgres:5432/ledgerflow
+      - DATABASE_URL=postgresql://ledger:secret@pgbouncer:6432/ledgerflow?pgbouncer=true&connection_limit=25
       - REDIS_URL=redis://redis:6379
-      - JWT_SECRET=ledgerflow-ultra-production-secret-server2
+      - JWT_SECRET=${JWT_SECRET:-ledgerflow-shared-cluster-jwt-secret-2026}
     ports:
       - "4002:4002"
     healthcheck:
@@ -63,22 +66,22 @@ services:
       timeout: 5s
       retries: 3
     depends_on:
-      - postgres
+      - pgbouncer
       - redis
     networks:
       - ledgerflow_network
 
-  # Application Server 3
   app3:
     build: .
     container_name: ledgerflow_app_server_3
     restart: always
     environment:
+      - NODE_ENV=production
       - PORT=4003
       - INSTANCE_ID=server-3
-      - DATABASE_URL=postgresql://ledger:secret@postgres:5432/ledgerflow
+      - DATABASE_URL=postgresql://ledger:secret@pgbouncer:6432/ledgerflow?pgbouncer=true&connection_limit=25
       - REDIS_URL=redis://redis:6379
-      - JWT_SECRET=ledgerflow-ultra-production-secret-server3
+      - JWT_SECRET=${JWT_SECRET:-ledgerflow-shared-cluster-jwt-secret-2026}
     ports:
       - "4003:4003"
     healthcheck:
@@ -87,8 +90,53 @@ services:
       timeout: 5s
       retries: 3
     depends_on:
-      - postgres
+      - pgbouncer
       - redis
+    networks:
+      - ledgerflow_network
+
+  app4:
+    build: .
+    container_name: ledgerflow_app_server_4
+    restart: always
+    environment:
+      - NODE_ENV=production
+      - PORT=4004
+      - INSTANCE_ID=server-4
+      - DATABASE_URL=postgresql://ledger:secret@pgbouncer:6432/ledgerflow?pgbouncer=true&connection_limit=25
+      - REDIS_URL=redis://redis:6379
+      - JWT_SECRET=${JWT_SECRET:-ledgerflow-shared-cluster-jwt-secret-2026}
+    ports:
+      - "4004:4004"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:4004/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    depends_on:
+      - pgbouncer
+      - redis
+    networks:
+      - ledgerflow_network
+
+  # PgBouncer Connection Pooler (Multiplexes thousands of concurrent requests onto Postgres)
+  pgbouncer:
+    image: edoburu/pgbouncer:latest
+    container_name: ledgerflow_pgbouncer
+    restart: always
+    environment:
+      - DB_USER=ledger
+      - DB_PASSWORD=secret
+      - DB_HOST=postgres
+      - DB_NAME=ledgerflow
+      - POOL_MODE=transaction
+      - MAX_CLIENT_CONN=4000
+      - DEFAULT_POOL_SIZE=60
+      - RESERVE_POOL_SIZE=20
+    ports:
+      - "6432:6432"
+    depends_on:
+      - postgres
     networks:
       - ledgerflow_network
 
@@ -97,6 +145,7 @@ services:
     image: postgres:16-alpine
     container_name: ledgerflow_postgres_db
     restart: always
+    command: ["postgres", "-c", "max_connections=300", "-c", "shared_buffers=512MB", "-c", "effective_cache_size=1536MB", "-c", "work_mem=8MB"]
     environment:
       POSTGRES_USER: ledger
       POSTGRES_PASSWORD: secret
@@ -113,6 +162,7 @@ services:
     image: redis:7-alpine
     container_name: ledgerflow_redis_cache
     restart: always
+    command: ["redis-server", "--maxmemory", "512mb", "--maxmemory-policy", "allkeys-lru", "--save", ""]
     ports:
       - "6379:6379"
     volumes:

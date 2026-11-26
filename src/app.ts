@@ -11,11 +11,22 @@ import { TransactionController } from './controllers/transactionController';
 import { BudgetController } from './controllers/budgetController';
 import { ReportController } from './controllers/reportController';
 import { AdminController } from './controllers/adminController';
+import { BackupController } from './controllers/backupController';
+import { BackupService } from './services/backupService';
+import { cacheService } from './services/cacheService';
+import { distributedCache } from './services/distributedCache';
+import { jobQueue } from './services/jobQueue';
 
 import { authMiddleware, requireGlobalRole } from './middleware/auth';
 import { tenantGuard } from './middleware/tenant';
 import { rateLimiter } from './middleware/rateLimiter';
 import { errorHandler } from './middleware/errorHandler';
+import {
+  getUtcpManual,
+  getOpenApiSpec,
+  getMcpToolCatalog,
+  executeHybridToolCall,
+} from './protocols/utcp';
 
 export function createApp(customInstanceId?: string): Express {
   const app = express();
@@ -43,9 +54,9 @@ export function createApp(customInstanceId?: string): Express {
   app.use(express.json({ limit: '10mb' }));
   app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
-  // 4. Rate Limiting Middleware
-  const authLimiter = rateLimiter({ maxRequests: 20, windowMs: 60 * 1000, message: 'Too many authentication attempts. Please wait.' });
-  const generalLimiter = rateLimiter({ maxRequests: 300, windowMs: 60 * 1000 });
+  // 4. Rate Limiting Middleware (per-tenant/IP bounded sliding window)
+  const authLimiter = rateLimiter({ maxRequests: 60, windowMs: 60 * 1000, message: 'Too many authentication attempts. Please wait.' });
+  const generalLimiter = rateLimiter({ maxRequests: parseInt(process.env.API_RATE_LIMIT_MAX || '2500', 10), windowMs: 60 * 1000 });
 
   app.use('/api', generalLimiter);
 
@@ -92,6 +103,66 @@ export function createApp(customInstanceId?: string): Express {
   app.get('/api/admin/users', authMiddleware, requireGlobalRole('SUPER_ADMIN'), AdminController.getUsers);
   app.get('/api/admin/analytics', authMiddleware, AdminController.getAnalytics);
   app.get('/api/admin/audit-logs', authMiddleware, requireGlobalRole('SUPER_ADMIN'), AdminController.getAuditLogs);
+  app.get('/api/admin/scalability', authMiddleware, (req, res) => {
+    res.status(200).json({
+      success: true,
+      data: {
+        instanceId,
+        uptimeSeconds: Math.floor(process.uptime()),
+        cache: cacheService.stats(),
+        distributedCache: distributedCache.status(),
+        jobQueue: jobQueue.stats(),
+        retentionSchedulerActive: true,
+      },
+    });
+  });
+
+  // 10a. Smart Reset, 5-Day Encrypted Backups & Merge Restore
+  if (process.env.VERCEL !== '1') {
+    BackupService.startRetentionScheduler();
+  }
+  app.get('/api/backups', authMiddleware, tenantGuard, BackupController.getDashboard);
+  app.post('/api/backups', authMiddleware, tenantGuard, BackupController.createManualBackup);
+  app.post('/api/backups/reset', authMiddleware, tenantGuard, BackupController.smartReset);
+  app.get('/api/backups/:id/preview', authMiddleware, tenantGuard, BackupController.previewRestore);
+  app.post('/api/backups/:id/restore-full', authMiddleware, tenantGuard, BackupController.restoreFull);
+  app.post('/api/backups/:id/restore-merge', authMiddleware, tenantGuard, BackupController.restoreMerge);
+  app.delete('/api/backups/:id', authMiddleware, tenantGuard, BackupController.deleteBackup);
+
+  // 10b. MCP + UTCP Hybrid Discovery & Unified Tool Router
+  const resolveOrigin = (req: any) => `${req.protocol}://${req.get('host') || `127.0.0.1:${config.port}`}`;
+
+  app.get('/utcp-manual.json', (req, res) => {
+    res.status(200).json(getUtcpManual(resolveOrigin(req)));
+  });
+  app.get('/api/utcp/manual', (req, res) => {
+    res.status(200).json(getUtcpManual(resolveOrigin(req)));
+  });
+  app.get('/openapi.json', (req, res) => {
+    res.status(200).json(getOpenApiSpec(resolveOrigin(req)));
+  });
+  app.get('/api/mcp/tools', (req, res) => {
+    res.status(200).json(getMcpToolCatalog());
+  });
+  app.post('/api/utcp/call', authMiddleware, tenantGuard, async (req: any, res, next) => {
+    try {
+      const protocol = req.body?.protocol === 'mcp' ? 'mcp' : 'utcp';
+      const toolName = String(req.body?.tool || req.body?.toolName || '').trim();
+      if (!toolName) {
+        return res.status(400).json({ error: 'Missing required field: tool' });
+      }
+      const response = await executeHybridToolCall({
+        protocol,
+        toolName,
+        args: req.body?.arguments || req.body?.args || {},
+        orgId: req.orgId,
+        userId: req.user.id,
+      });
+      res.status(200).json(response);
+    } catch (err) {
+      next(err);
+    }
+  });
 
   // 11. Static Client UI Serving
   const possiblePaths = [

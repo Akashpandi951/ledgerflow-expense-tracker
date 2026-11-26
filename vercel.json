@@ -1,5 +1,6 @@
 {
   "version": 2,
+  "outputDirectory": "public",
   "functions": {
     "api/index.ts": {
       "memory": 1024,
@@ -8,6 +9,8 @@
   },
   "rewrites": [
     { "source": "/health", "destination": "/api" },
+    { "source": "/utcp-manual.json", "destination": "/api" },
+    { "source": "/openapi.json", "destination": "/api" },
     { "source": "/api/(.*)", "destination": "/api" }
   ]
 }

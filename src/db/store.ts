@@ -10,18 +10,147 @@ import {
   SavingsGoalRecord,
   MonthlyReportRecord,
   AuditLogRecord,
-  NotificationRecord
+  NotificationRecord,
+  BackupSnapshotRecord,
+  ResetEventRecord,
+  RestoreEventRecord
 } from '../types';
 
+/**
+ * O(1) Tenant-Indexed Map: keeps an automatic secondary orgId -> Set<id> index
+ * so multi-tenant queries scale to 100,000+ users without O(N) full scans.
+ */
+class IndexedOrgMap<V extends { orgId: string }> extends Map<string, V> {
+  private readonly orgIndex = new Map<string, Set<string>>();
+
+  public override set(key: string, value: V): this {
+    const prev = super.get(key);
+    if (prev && prev.orgId !== value.orgId) {
+      this.orgIndex.get(prev.orgId)?.delete(key);
+    }
+    super.set(key, value);
+    let bucket = this.orgIndex.get(value.orgId);
+    if (!bucket) {
+      bucket = new Set<string>();
+      this.orgIndex.set(value.orgId, bucket);
+    }
+    bucket.add(key);
+    return this;
+  }
+
+  public override delete(key: string): boolean {
+    const prev = super.get(key);
+    if (prev) {
+      this.orgIndex.get(prev.orgId)?.delete(key);
+    }
+    return super.delete(key);
+  }
+
+  public override clear(): void {
+    this.orgIndex.clear();
+    super.clear();
+  }
+
+  public getByOrg(orgId: string): V[] {
+    const ids = this.orgIndex.get(orgId);
+    if (!ids || ids.size === 0) return [];
+    const out: V[] = [];
+    for (const id of ids) {
+      const item = super.get(id);
+      if (item) out.push(item);
+    }
+    return out;
+  }
+}
+
+class IndexedUserMap extends Map<string, UserRecord> {
+  private readonly emailIndex = new Map<string, string>();
+
+  public override set(key: string, value: UserRecord): this {
+    const prev = super.get(key);
+    if (prev && prev.email.toLowerCase() !== value.email.toLowerCase()) {
+      this.emailIndex.delete(prev.email.toLowerCase());
+    }
+    super.set(key, value);
+    this.emailIndex.set(value.email.toLowerCase(), key);
+    return this;
+  }
+
+  public override delete(key: string): boolean {
+    const prev = super.get(key);
+    if (prev) this.emailIndex.delete(prev.email.toLowerCase());
+    return super.delete(key);
+  }
+
+  public override clear(): void {
+    this.emailIndex.clear();
+    super.clear();
+  }
+
+  public findByEmail(email: string): UserRecord | undefined {
+    const id = this.emailIndex.get(email.toLowerCase().trim());
+    return id ? super.get(id) : undefined;
+  }
+}
+
+class IndexedMembershipMap extends Map<string, MembershipRecord> {
+  private readonly pairIndex = new Map<string, string>();
+  private readonly userIndex = new Map<string, Set<string>>();
+
+  public override set(key: string, value: MembershipRecord): this {
+    super.set(key, value);
+    this.pairIndex.set(`${value.userId}:${value.orgId}`, key);
+    let bucket = this.userIndex.get(value.userId);
+    if (!bucket) {
+      bucket = new Set<string>();
+      this.userIndex.set(value.userId, bucket);
+    }
+    bucket.add(key);
+    return this;
+  }
+
+  public override delete(key: string): boolean {
+    const prev = super.get(key);
+    if (prev) {
+      this.pairIndex.delete(`${prev.userId}:${prev.orgId}`);
+      this.userIndex.get(prev.userId)?.delete(key);
+    }
+    return super.delete(key);
+  }
+
+  public override clear(): void {
+    this.pairIndex.clear();
+    this.userIndex.clear();
+    super.clear();
+  }
+
+  public findByUserAndOrg(userId: string, orgId: string): MembershipRecord | undefined {
+    const id = this.pairIndex.get(`${userId}:${orgId}`);
+    return id ? super.get(id) : undefined;
+  }
+
+  public getPrimaryForUser(userId: string): MembershipRecord | undefined {
+    const bucket = this.userIndex.get(userId);
+    if (!bucket || bucket.size === 0) return undefined;
+    const firstId = bucket.values().next().value;
+    return firstId ? super.get(firstId) : undefined;
+  }
+}
+
 export class MemoryStore {
-  public users: Map<string, UserRecord> = new Map();
+  public users: IndexedUserMap = new IndexedUserMap();
   public organizations: Map<string, OrganizationRecord> = new Map();
-  public memberships: Map<string, MembershipRecord> = new Map();
-  public accounts: Map<string, AccountRecord> = new Map();
-  public transactions: Map<string, TransactionRecord> = new Map();
-  public budgets: Map<string, BudgetRecord> = new Map();
-  public goals: Map<string, SavingsGoalRecord> = new Map();
+  public memberships: IndexedMembershipMap = new IndexedMembershipMap();
+  public accounts: IndexedOrgMap<AccountRecord> = new IndexedOrgMap();
+  public transactions: IndexedOrgMap<TransactionRecord> = new IndexedOrgMap();
+  public budgets: IndexedOrgMap<BudgetRecord> = new IndexedOrgMap();
+  public goals: IndexedOrgMap<SavingsGoalRecord> = new IndexedOrgMap();
   public monthlyReports: Map<string, MonthlyReportRecord> = new Map();
+  public backups: IndexedOrgMap<BackupSnapshotRecord> = new IndexedOrgMap();
+  public resetEvents: ResetEventRecord[] = [];
+  public restoreEvents: RestoreEventRecord[] = [];
+  public mergedBackupIdsByOrg: Map<string, Set<string>> = new Map();
+  public restoredEntryIdsByOrg: Map<string, Set<string>> = new Map();
   public auditLogs: AuditLogRecord[] = [];
   public notifications: Map<string, NotificationRecord> = new Map();
   public refreshTokens: Map<string, { userId: string; expiresAt: Date }> = new Map();
@@ -210,49 +339,36 @@ export class MemoryStore {
   }
 
   // ==========================================
-  // MULTI-TENANT ISOLATION QUERIES
+  // MULTI-TENANT ISOLATION QUERIES (O(1) Org Index)
   // ==========================================
   public getTransactions(orgId: string, userId?: string): TransactionRecord[] {
-    const list: TransactionRecord[] = [];
-    for (const tx of this.transactions.values()) {
-      // Must match orgId, and if user is regular member, must match userId
-      if (tx.orgId === orgId && (!userId || tx.userId === userId)) {
-        list.push(tx);
-      }
-    }
-    return list.sort((a, b) => b.date.localeCompare(a.date));
+    const orgList = this.transactions.getByOrg(orgId);
+    const filtered = userId ? orgList.filter((tx) => tx.userId === userId) : orgList;
+    return filtered.sort((a, b) => b.date.localeCompare(a.date));
   }
 
   public getAccounts(orgId: string, userId?: string): AccountRecord[] {
-    const list: AccountRecord[] = [];
-    for (const acc of this.accounts.values()) {
-      if (acc.orgId === orgId && (!userId || acc.userId === userId)) {
-        list.push(acc);
-      }
-    }
-    return list;
+    const orgList = this.accounts.getByOrg(orgId);
+    return userId ? orgList.filter((acc) => acc.userId === userId) : orgList;
   }
 
   public getBudgets(orgId: string, userId?: string, monthKey?: string): BudgetRecord[] {
-    const list: BudgetRecord[] = [];
-    for (const b of this.budgets.values()) {
-      if (b.orgId === orgId && (!userId || b.userId === userId)) {
-        if (!monthKey || b.monthKey === monthKey) {
-          list.push(b);
-        }
-      }
-    }
-    return list;
+    return this.budgets.getByOrg(orgId).filter((b) => {
+      if (userId && b.userId !== userId) return false;
+      if (monthKey && b.monthKey !== monthKey) return false;
+      return true;
+    });
   }
 
   public getGoals(orgId: string, userId?: string): SavingsGoalRecord[] {
-    const list: SavingsGoalRecord[] = [];
-    for (const g of this.goals.values()) {
-      if (g.orgId === orgId && (!userId || g.userId === userId)) {
-        list.push(g);
-      }
-    }
-    return list;
+    const orgList = this.goals.getByOrg(orgId);
+    return userId ? orgList.filter((g) => g.userId === userId) : orgList;
+  }
+
+  public getBackups(orgId: string): BackupSnapshotRecord[] {
+    return this.backups
+      .getByOrg(orgId)
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
   }
 
   public logAudit(orgId: string | null, userId: string | null, action: string, details?: any, ip?: string, ua?: string) {

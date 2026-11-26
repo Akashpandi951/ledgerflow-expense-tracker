@@ -3,6 +3,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { store } from '../db/store';
 import { AuthenticatedRequest } from '../middleware/auth';
 import { TransactionRecord } from '../types';
+import { cacheService } from '../services/cacheService';
 
 export class TransactionController {
   public static async list(req: AuthenticatedRequest, res: Response): Promise<void> {
@@ -12,7 +13,14 @@ export class TransactionController {
       return;
     }
 
-    const { category, type, startDate, endDate, search, page = '1', limit = '50' } = req.query;
+    const { category, type, startDate, endDate, search, page = '1', limit = '50', cursor } = req.query;
+    const cacheKey = `org:${orgId}:tx:${req.user?.tenantRole === 'MEMBER' ? req.user.userId : 'all'}:${category || ''}:${type || ''}:${startDate || ''}:${endDate || ''}:${search || ''}:${page}:${limit}:${cursor || ''}`;
+    const cached = cacheService.get<any>(cacheKey);
+    if (cached) {
+      res.status(200).json(cached);
+      return;
+    }
+
     let list = store.getTransactions(orgId, req.user?.tenantRole === 'MEMBER' ? req.user.userId : undefined);
 
     if (category) {
@@ -36,20 +44,33 @@ export class TransactionController {
       );
     }
 
-    const p = Math.max(1, parseInt(String(page), 10));
-    const lim = Math.max(1, Math.min(200, parseInt(String(limit), 10)));
+    const p = Math.max(1, parseInt(String(page), 10) || 1);
+    const lim = Math.max(1, Math.min(200, parseInt(String(limit), 10) || 50));
     const totalCount = list.length;
-    const paginated = list.slice((p - 1) * lim, p * lim);
+
+    let paginated: TransactionRecord[];
+    if (cursor) {
+      const [cDate, cId] = String(cursor).split(':');
+      const idx = list.findIndex((tx) => tx.date < cDate || (tx.date === cDate && tx.id === cId));
+      const startIdx = idx >= 0 ? idx + 1 : 0;
+      paginated = list.slice(startIdx, startIdx + lim);
+    } else {
+      paginated = list.slice((p - 1) * lim, p * lim);
+    }
+
+    const lastItem = paginated[paginated.length - 1];
+    const nextCursor = lastItem && paginated.length === lim ? `${lastItem.date}:${lastItem.id}` : null;
 
     // Calculate aggregated totals in exact paise
     let totalIncomePaise = 0;
     let totalExpensePaise = 0;
     for (const tx of list) {
+      if (tx.isPreReset) continue;
       if (tx.type === 'INCOME') totalIncomePaise += tx.amountPaise;
       if (tx.type === 'EXPENSE') totalExpensePaise += tx.amountPaise;
     }
 
-    res.status(200).json({
+    const payload = {
       success: true,
       data: {
         items: paginated,
@@ -58,12 +79,15 @@ export class TransactionController {
           page: p,
           limit: lim,
           totalPages: Math.ceil(totalCount / lim),
+          nextCursor,
           totalIncomePaise,
           totalExpensePaise,
           netBalancePaise: totalIncomePaise - totalExpensePaise
         }
       }
-    });
+    };
+    cacheService.set(cacheKey, payload, 5_000);
+    res.status(200).json(payload);
   }
 
   public static async create(req: AuthenticatedRequest, res: Response): Promise<void> {
@@ -131,6 +155,7 @@ export class TransactionController {
       }
 
       store.logAudit(orgId, userId, 'TRANSACTION_CREATED', { txId, title, amountPaise: numPaise, type: newTx.type });
+      cacheService.invalidatePrefix(`org:${orgId}:`);
 
       res.status(201).json({
         success: true,
@@ -181,6 +206,7 @@ export class TransactionController {
 
     store.transactions.delete(id);
     store.logAudit(orgId || null, req.user?.userId || null, 'TRANSACTION_DELETED', { txId: id, title: tx.title });
+    if (orgId) cacheService.invalidatePrefix(`org:${orgId}:`);
 
     res.status(200).json({ success: true, message: 'Transaction deleted successfully.' });
   }

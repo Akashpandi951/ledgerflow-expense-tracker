@@ -43,6 +43,25 @@ enum NotificationLevel {
   CRITICAL
 }
 
+enum BackupStatus {
+  ACTIVE
+  EXPIRING_SOON
+  EXPIRED
+  RESTORED
+  DELETED
+}
+
+enum ResetScope {
+  FULL
+  CATEGORY
+  ACCOUNT
+}
+
+enum RestoreMode {
+  FULL
+  MERGE
+}
+
 model User {
   id                  String             @id @default(uuid())
   email               String             @unique
@@ -146,6 +165,8 @@ model Transaction {
   notes        String?
   tags         String[]        @default([])
   receiptUrl   String?
+  isPreReset   Boolean         @default(false)
+  resetEventId String?
   createdAt    DateTime        @default(now())
   updatedAt    DateTime        @updatedAt
 
@@ -155,6 +176,8 @@ model Transaction {
   toAccount    Account?        @relation("TransferToAccount", fields: [toAccountId], references: [id], onDelete: SetNull)
 
   @@index([orgId, date])
+  @@index([orgId, type, date])
+  @@index([orgId, accountId, date])
   @@index([userId, date])
   @@index([orgId, category])
 }
@@ -317,4 +340,69 @@ model EmailVerificationToken {
   createdAt DateTime @default(now())
 
   user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model BackupSnapshot {
+  id                   String       @id @default(uuid())
+  orgId                String
+  userId               String
+  triggerType          String       @default("SMART_RESET")
+  scope                ResetScope   @default(FULL)
+  scopeTarget             String?
+  previousBalancePaise    BigInt
+  previousIncomePaise     BigInt       @default(0)
+  previousExpensePaise    BigInt       @default(0)
+  previousNetSavingsPaise BigInt       @default(0)
+  resetAmountPaise        BigInt       @default(0)
+  transactionCount     Int          @default(0)
+  accountCount         Int          @default(0)
+  status               BackupStatus @default(ACTIVE)
+  encryptedPayload     String
+  iv                   String
+  authTag              String
+  checksumSha256       String
+  createdAt            DateTime     @default(now())
+  expiresAt            DateTime
+  expiredAt            DateTime?
+  restoredAt           DateTime?
+  mergedAt             DateTime?
+  deletedAt            DateTime?
+
+  @@index([orgId, status, expiresAt])
+  @@index([orgId, createdAt])
+  @@index([expiresAt])
+}
+
+model ResetEvent {
+  id                    String     @id @default(uuid())
+  orgId                 String
+  userId                String
+  backupId              String
+  scope                 ResetScope @default(FULL)
+  scopeTarget           String?
+  previousBalancePaise  BigInt
+  resetAmountPaise      BigInt
+  newBalancePaise       BigInt
+  preservedRecordsCount Int        @default(0)
+  createdAt             DateTime   @default(now())
+
+  @@index([orgId, createdAt])
+}
+
+model RestoreEvent {
+  id                     String      @id @default(uuid())
+  orgId                  String
+  userId                 String
+  backupId               String
+  mode                   RestoreMode
+  previousBalancePaise   BigInt
+  recoveredAmountPaise   BigInt
+  finalBalancePaise      BigInt
+  recoveredRecordsCount  Int         @default(0)
+  skippedDuplicatesCount Int         @default(0)
+  safetyBackupId         String?
+  createdAt              DateTime    @default(now())
+
+  @@index([orgId, createdAt])
+  @@index([backupId])
 }

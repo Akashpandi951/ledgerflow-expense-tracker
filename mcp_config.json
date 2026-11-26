@@ -12,6 +12,18 @@
       "env": {
         "LEDGERFLOW_API_URL": "http://127.0.0.1:4000"
       }
+    },
+    "utcp": {
+      "command": "cmd.exe",
+      "args": [
+        "/d",
+        "/c",
+        "npx",
+        "@utcp/mcp-bridge"
+      ],
+      "env": {
+        "UTCP_CONFIG_FILE": "D:\\Downloads\\ledgerflow_expense_tracker\\.utcp_config.json"
+      }
     }
   }
 }

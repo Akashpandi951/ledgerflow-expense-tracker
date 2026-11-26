@@ -28,12 +28,10 @@ export function tenantGuard(req: AuthenticatedRequest, res: Response, next: Next
     hasMembership = true;
     userTenantRole = 'OWNER';
   } else {
-    for (const mem of store.memberships.values()) {
-      if (mem.userId === req.user.userId && mem.orgId === requestedOrgId) {
-        hasMembership = true;
-        userTenantRole = mem.role;
-        break;
-      }
+    const mem = store.memberships.findByUserAndOrg(req.user.userId, requestedOrgId);
+    if (mem) {
+      hasMembership = true;
+      userTenantRole = mem.role;
     }
   }
 

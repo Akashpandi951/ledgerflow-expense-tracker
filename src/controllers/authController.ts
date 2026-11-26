@@ -30,16 +30,14 @@ export class AuthController {
 
       const normalizedEmail = email.toLowerCase().trim();
 
-      // Check unique email
-      for (const u of store.users.values()) {
-        if (u.email.toLowerCase() === normalizedEmail) {
-          res.status(409).json({
-            success: false,
-            error: 'EMAIL_ALREADY_EXISTS',
-            message: 'An account with this email address is already registered.'
-          });
-          return;
-        }
+      // O(1) email uniqueness check
+      if (store.users.findByEmail(normalizedEmail)) {
+        res.status(409).json({
+          success: false,
+          error: 'EMAIL_ALREADY_EXISTS',
+          message: 'An account with this email address is already registered.'
+        });
+        return;
       }
 
       const userId = uuidv4();
@@ -157,14 +155,7 @@ export class AuthController {
       }
 
       const normalizedEmail = email.toLowerCase().trim();
-      let matchedUser: any = null;
-
-      for (const u of store.users.values()) {
-        if (u.email.toLowerCase() === normalizedEmail) {
-          matchedUser = u;
-          break;
-        }
-      }
+      const matchedUser = store.users.findByEmail(normalizedEmail);
 
       if (!matchedUser) {
         res.status(401).json({
@@ -185,16 +176,10 @@ export class AuthController {
         return;
       }
 
-      // Find user's primary organization
-      let userOrgId = '';
-      let userRole: any = 'MEMBER';
-      for (const m of store.memberships.values()) {
-        if (m.userId === matchedUser.id) {
-          userOrgId = m.orgId;
-          userRole = m.role;
-          break;
-        }
-      }
+      // Find user's primary organization in O(1)
+      const primaryMem = store.memberships.getPrimaryForUser(matchedUser.id);
+      const userOrgId = primaryMem ? primaryMem.orgId : '';
+      const userRole: any = primaryMem ? primaryMem.role : 'MEMBER';
 
       const tokenPayload = {
         userId: matchedUser.id,

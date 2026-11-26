@@ -246,8 +246,14 @@
   function getActiveWorkspace() {
     const email = STORE.activeUserEmail || 'alex@ledgerflow.app';
     if (!STORE.workspaces[email]) STORE.workspaces[email] = createSeedWorkspace('User', email, false);
-    if (!STORE.workspaces[email].auditLogs) STORE.workspaces[email].auditLogs = [];
-    return STORE.workspaces[email];
+    const ws = STORE.workspaces[email];
+    if (!ws.auditLogs) ws.auditLogs = [];
+    if (!ws.backups) ws.backups = [];
+    if (!ws.resetEvents) ws.resetEvents = [];
+    if (!ws.restoreEvents) ws.restoreEvents = [];
+    if (!ws.mergedBackupIds) ws.mergedBackupIds = [];
+    if (!ws.restoredEntryIds) ws.restoredEntryIds = [];
+    return ws;
   }
   function logAudit(action, detail) {
     const ws = getActiveWorkspace();
@@ -266,6 +272,7 @@
     calSelectedDate: todayISO(),
     wealthTab: 'accounts',
     txFilters: { search: '', type: 'all', category: 'all', method: 'all', account: 'all', sort: 'newest' },
+    txWindowLimit: 60,
     charts: {},
     chatHistory: [],
     authMode: 'login',
@@ -315,9 +322,14 @@
     });
   }
 
+  function getActiveTxs(ws) {
+    return (ws.transactions || []).filter(t => !t.isPreReset);
+  }
+
   function calcAccountBalance(acc, txs) {
     let bal = acc.openingPaise || 0;
     for (const t of txs) {
+      if (t.isPreReset) continue;
       if (t.type === 'income' && t.accountId === acc.id) bal += t.amountPaise;
       else if (t.type === 'expense' && t.accountId === acc.id) bal -= t.amountPaise;
       else if (t.type === 'transfer') {
@@ -326,6 +338,361 @@
       }
     }
     return bal;
+  }
+
+  // =========================================================================
+  // 2B. SMART RESET, 5-DAY BACKUP HISTORY & MERGE RESTORE ENGINE
+  // =========================================================================
+  const FIVE_DAYS_MS = 5 * 24 * 60 * 60 * 1000;
+  const EXPIRING_SOON_MS = 24 * 60 * 60 * 1000;
+
+  function computeIntegrityHash(str) {
+    let h1 = 0xdeadbeef, h2 = 0x41c6ce57;
+    for (let i = 0; i < str.length; i++) {
+      const ch = str.charCodeAt(i);
+      h1 = Math.imul(h1 ^ ch, 2654435761);
+      h2 = Math.imul(h2 ^ ch, 1597334677);
+    }
+    h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+    h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+    return (4294967296 * (2097151 & h2) + (h1 >>> 0)).toString(16).padStart(14, '0');
+  }
+
+  function formatBackupCountdown(expiresAtIso, nowMs = Date.now()) {
+    const diff = Date.parse(expiresAtIso) - nowMs;
+    if (diff <= 0) return { remainingMs: 0, isExpired: true, label: 'Expired' };
+    const days = Math.floor(diff / (24 * 60 * 60 * 1000));
+    const hours = Math.floor((diff % (24 * 60 * 60 * 1000)) / (60 * 60 * 1000));
+    const mins = Math.floor((diff % (60 * 60 * 1000)) / (60 * 1000));
+    const parts = [];
+    if (days > 0) parts.push(`${days} day${days === 1 ? '' : 's'}`);
+    if (hours > 0 || days > 0) parts.push(`${hours} hour${hours === 1 ? '' : 's'}`);
+    if (days === 0) parts.push(`${mins} min${mins === 1 ? '' : 's'}`);
+    return { remainingMs: diff, isExpired: false, label: `This backup will expire in ${parts.join(', ')}.` };
+  }
+
+  function sweepWorkspaceBackups(ws, nowMs = Date.now()) {
+    let changed = false;
+    (ws.backups || []).forEach(b => {
+      if (b.status === 'DELETED' || b.status === 'EXPIRED') return;
+      const expMs = Date.parse(b.expiresAt);
+      if (nowMs >= expMs) {
+        b.status = 'EXPIRED';
+        b.expiredAt = new Date(nowMs).toISOString();
+        ws.auditLogs.unshift({ id: uid('log'), action: 'BACKUP_EXPIRED', detail: `Backup ${b.id} expired after 5-day retention`, time: todayISO() });
+        changed = true;
+      } else if (b.status === 'ACTIVE' && expMs - nowMs <= EXPIRING_SOON_MS) {
+        b.status = 'EXPIRING_SOON';
+        changed = true;
+      }
+    });
+    if (changed) saveStore();
+  }
+
+  function createLocalBackup(ws, triggerType, scope = 'FULL', scopeTarget = null, resetAmountPaise = 0) {
+    const nowMs = Date.now();
+    const createdAt = new Date(nowMs).toISOString();
+    const expiresAt = new Date(nowMs + FIVE_DAYS_MS).toISOString();
+    const accountBalancesPaise = {};
+    let previousBalancePaise = 0;
+    ws.accounts.forEach(a => {
+      const bal = calcAccountBalance(a, ws.transactions);
+      accountBalancesPaise[a.id] = bal;
+      previousBalancePaise += bal;
+    });
+
+    const activeTxs = getActiveTxs(ws);
+    const totals = calcTotals(activeTxs);
+    const snapshot = {
+      version: '2.0',
+      capturedAt: createdAt,
+      scope,
+      scopeTarget,
+      accountBalancesPaise,
+      accounts: JSON.parse(JSON.stringify(ws.accounts)),
+      transactions: JSON.parse(JSON.stringify(ws.transactions)),
+      categories: JSON.parse(JSON.stringify(ws.categories)),
+      budgets: JSON.parse(JSON.stringify(ws.budgets)),
+      goals: JSON.parse(JSON.stringify(ws.goals))
+    };
+    const serialized = JSON.stringify(snapshot);
+    const checksum = computeIntegrityHash(serialized);
+    // Verify integrity before accepting backup
+    if (computeIntegrityHash(serialized) !== checksum) {
+      throw new Error('Backup integrity verification failed.');
+    }
+    const id = `BKP-${nowMs.toString(36).toUpperCase()}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`;
+    const record = {
+      id,
+      triggerType,
+      scope,
+      scopeTarget,
+      previousBalancePaise,
+      previousIncomePaise: totals.income,
+      previousExpensePaise: totals.expense,
+      previousNetSavingsPaise: totals.net,
+      resetAmountPaise,
+      transactionCount: ws.transactions.length,
+      accountCount: ws.accounts.length,
+      status: 'ACTIVE',
+      checksum,
+      snapshotJson: serialized,
+      createdAt,
+      expiresAt,
+      expiredAt: null,
+      restoredAt: null,
+      mergedAt: null,
+      deletedAt: null
+    };
+    ws.backups.unshift(record);
+    logAudit('BACKUP_CREATED', `Created 5-day encrypted snapshot ${id} (Bal ${fmtMoney(previousBalancePaise)} | Inc ${fmtMoney(totals.income)} | Exp ${fmtMoney(totals.expense)})`);
+    return record;
+  }
+
+  function performSmartReset(scope, scopeTarget) {
+    const ws = getActiveWorkspace();
+    const activeTxs = getActiveTxs(ws);
+    const activeTotals = calcTotals(activeTxs);
+    const previousBalancePaise = ws.accounts.reduce((s, a) => s + calcAccountBalance(a, ws.transactions), 0);
+    let resetAmountPaise = 0;
+
+    if (scope === 'FULL') {
+      resetAmountPaise = previousBalancePaise;
+    } else if (scope === 'ACCOUNT') {
+      const target = ws.accounts.find(a => a.id === scopeTarget);
+      if (!target) throw new Error('Account not found');
+      resetAmountPaise = calcAccountBalance(target, ws.transactions);
+    } else if (scope === 'CATEGORY') {
+      resetAmountPaise = activeTxs
+        .filter(t => t.category === scopeTarget)
+        .reduce((s, t) => s + (t.type === 'income' ? t.amountPaise : t.type === 'expense' ? -t.amountPaise : 0), 0);
+    }
+
+    // 1. Capture rollback state & create verified backup BEFORE any mutation
+    const rollbackAccounts = JSON.stringify(ws.accounts);
+    const rollbackTxs = JSON.stringify(ws.transactions);
+    const rollbackBudgets = JSON.stringify(ws.budgets);
+    const backup = createLocalBackup(ws, 'SMART_RESET', scope, scopeTarget, resetAmountPaise);
+    const resetId = `RST-${Date.now().toString(36).toUpperCase()}`;
+
+    try {
+      // 2. Zero selected balances & mark pre-reset transactions (preserved in history, excluded from active totals)
+      if (scope === 'FULL') {
+        ws.accounts.forEach(a => { a.openingPaise = 0; });
+        ws.transactions.forEach(t => { t.isPreReset = true; t.resetEventId = resetId; });
+      } else if (scope === 'ACCOUNT') {
+        const target = ws.accounts.find(a => a.id === scopeTarget);
+        if (target) target.openingPaise = 0;
+        ws.transactions.forEach(t => {
+          if (t.accountId === scopeTarget) { t.isPreReset = true; t.resetEventId = resetId; }
+        });
+      } else if (scope === 'CATEGORY') {
+        ws.transactions.forEach(t => {
+          if (t.category === scopeTarget && !t.isPreReset) { t.isPreReset = true; t.resetEventId = resetId; }
+        });
+        if (ws.budgets && ws.budgets.categories && ws.budgets.categories[scopeTarget] !== undefined) {
+          ws.budgets.categories[scopeTarget] = 0;
+        }
+      }
+    } catch (err) {
+      ws.accounts = JSON.parse(rollbackAccounts);
+      ws.transactions = JSON.parse(rollbackTxs);
+      ws.budgets = JSON.parse(rollbackBudgets);
+      throw err;
+    }
+
+    const newBalancePaise = ws.accounts.reduce((s, a) => s + calcAccountBalance(a, ws.transactions), 0);
+    const resetEvent = {
+      id: resetId,
+      backupId: backup.id,
+      scope,
+      scopeTarget: scopeTarget || 'All Accounts',
+      previousBalancePaise,
+      previousIncomePaise: activeTotals.income,
+      previousExpensePaise: activeTotals.expense,
+      previousNetSavingsPaise: activeTotals.net,
+      resetAmountPaise,
+      newBalancePaise,
+      preservedRecordsCount: ws.transactions.length,
+      user: ws.profile.email,
+      createdAt: new Date().toISOString()
+    };
+    ws.resetEvents.unshift(resetEvent);
+    logAudit('SMART_RESET', `Reset ${scope} (${fmtMoney(resetAmountPaise)}) -> Backup ${backup.id}; ${ws.transactions.length} records preserved`);
+    saveStore();
+
+    if (STORE.authToken) {
+      fetch('/api/backups/reset', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${STORE.authToken}`, 'X-Organization-ID': 'org-alex-wealth-01' },
+        body: JSON.stringify({ scope, scopeTarget, confirm: true })
+      }).catch(() => {});
+    }
+    return { backup, resetEvent };
+  }
+
+  function previewLocalMergeRestore(backupId) {
+    const ws = getActiveWorkspace();
+    sweepWorkspaceBackups(ws);
+    const backup = ws.backups.find(b => b.id === backupId);
+    if (!backup) throw new Error('Backup not found');
+    if (backup.status === 'EXPIRED' || Date.now() >= Date.parse(backup.expiresAt)) {
+      throw new Error('This backup has expired after 5 days.');
+    }
+    if (computeIntegrityHash(backup.snapshotJson) !== backup.checksum) {
+      throw new Error('Backup integrity verification failed!');
+    }
+    const snap = JSON.parse(backup.snapshotJson);
+    const currentBalancePaise = ws.accounts.reduce((s, a) => s + calcAccountBalance(a, ws.transactions), 0);
+    const alreadyMerged = (ws.mergedBackupIds || []).includes(backup.id);
+    const activeTxMap = new Map(getActiveTxs(ws).map(t => [t.id, t]));
+    const restoredIds = new Set(ws.restoredEntryIds || []);
+
+    let newRecordsToRecover = 0;
+    let duplicateRecordsSkipped = 0;
+    let txRecoveryPaise = 0;
+    const accDeltaMap = {};
+
+    (snap.transactions || []).forEach(t => {
+      if (t.isPreReset) return;
+      if (activeTxMap.has(t.id) || restoredIds.has(t.id)) {
+        duplicateRecordsSkipped++;
+      } else {
+        newRecordsToRecover++;
+        const signed = t.type === 'income' ? t.amountPaise : t.type === 'expense' ? -t.amountPaise : 0;
+        txRecoveryPaise += signed;
+        if (t.type === 'transfer') {
+          accDeltaMap[t.accountId] = (accDeltaMap[t.accountId] || 0) - t.amountPaise;
+          if (t.toAccountId) accDeltaMap[t.toAccountId] = (accDeltaMap[t.toAccountId] || 0) + t.amountPaise;
+        } else {
+          accDeltaMap[t.accountId] = (accDeltaMap[t.accountId] || 0) + signed;
+        }
+      }
+    });
+
+    // Recover any opening balance from snapshot accounts that is separate from transaction sums (prevents double counting)
+    let openingRecoveryPaise = 0;
+    if (!alreadyMerged && backup.triggerType === 'SMART_RESET') {
+      (snap.accounts || []).forEach(sa => {
+        if (sa.openingPaise) {
+          openingRecoveryPaise += sa.openingPaise;
+          accDeltaMap[sa.id] = (accDeltaMap[sa.id] || 0) + sa.openingPaise;
+        }
+      });
+    }
+
+    const eligibleRecoveredPaise = alreadyMerged ? 0 : (txRecoveryPaise + openingRecoveryPaise);
+    return {
+      backup,
+      snap,
+      currentBalancePaise,
+      backupBalancePaise: backup.previousBalancePaise,
+      eligibleRecoveredPaise,
+      finalProjectedBalancePaise: currentBalancePaise + eligibleRecoveredPaise,
+      newRecordsToRecover: alreadyMerged ? 0 : newRecordsToRecover,
+      duplicateRecordsSkipped,
+      alreadyMerged,
+      accDeltaMap
+    };
+  }
+
+  function executeLocalFullRestore(backupId) {
+    const ws = getActiveWorkspace();
+    sweepWorkspaceBackups(ws);
+    const backup = ws.backups.find(b => b.id === backupId);
+    if (!backup || backup.status === 'EXPIRED' || backup.status === 'DELETED') throw new Error('Backup unavailable.');
+    if (computeIntegrityHash(backup.snapshotJson) !== backup.checksum) throw new Error('Integrity check failed.');
+
+    const previousBalancePaise = ws.accounts.reduce((s, a) => s + calcAccountBalance(a, ws.transactions), 0);
+    const safety = createLocalBackup(ws, 'PRE_RESTORE', 'FULL', null, 0);
+    const snap = JSON.parse(backup.snapshotJson);
+
+    ws.accounts = JSON.parse(JSON.stringify(snap.accounts));
+    ws.transactions = JSON.parse(JSON.stringify(snap.transactions));
+    ws.budgets = JSON.parse(JSON.stringify(snap.budgets));
+    ws.goals = JSON.parse(JSON.stringify(snap.goals));
+    backup.status = 'RESTORED';
+    backup.restoredAt = new Date().toISOString();
+
+    const finalBalancePaise = ws.accounts.reduce((s, a) => s + calcAccountBalance(a, ws.transactions), 0);
+    ws.restoreEvents.unshift({
+      id: `RES-${Date.now().toString(36).toUpperCase()}`,
+      backupId: backup.id,
+      mode: 'FULL',
+      previousBalancePaise,
+      recoveredAmountPaise: finalBalancePaise - previousBalancePaise,
+      finalBalancePaise,
+      recoveredRecordsCount: ws.transactions.length,
+      skippedDuplicatesCount: 0,
+      safetyBackupId: safety.id,
+      createdAt: new Date().toISOString()
+    });
+    logAudit('FULL_RESTORE', `Full restore from ${backup.id} (safety backup ${safety.id})`);
+    saveStore();
+  }
+
+  function executeLocalMergeRestore(backupId) {
+    const ws = getActiveWorkspace();
+    const preview = previewLocalMergeRestore(backupId);
+    if (preview.alreadyMerged && preview.newRecordsToRecover === 0) {
+      throw new Error('This backup has already been merged into the workspace.');
+    }
+
+    const safety = createLocalBackup(ws, 'PRE_RESTORE', 'FULL', null, 0);
+    const activeTxMap = new Map(getActiveTxs(ws).map(t => [t.id, t]));
+    const allTxMap = new Map(ws.transactions.map(t => [t.id, t]));
+    const restoredIds = new Set(ws.restoredEntryIds || []);
+
+    (preview.snap.accounts || []).forEach(sa => {
+      if (!ws.accounts.some(a => a.id === sa.id)) {
+        ws.accounts.push({ ...sa, openingPaise: 0 });
+      }
+      if (!preview.alreadyMerged && preview.backup.triggerType === 'SMART_RESET' && sa.openingPaise) {
+        const targetAcc = ws.accounts.find(a => a.id === sa.id);
+        if (targetAcc) targetAcc.openingPaise = (targetAcc.openingPaise || 0) + sa.openingPaise;
+      }
+    });
+
+    let recovered = 0;
+    let skipped = 0;
+    (preview.snap.transactions || []).forEach(t => {
+      if (t.isPreReset) return;
+      if (activeTxMap.has(t.id) || restoredIds.has(t.id)) {
+        skipped++;
+        return;
+      }
+      const existing = allTxMap.get(t.id);
+      if (existing) {
+        existing.isPreReset = false;
+        existing.resetEventId = null;
+        if (!existing.tags) existing.tags = [];
+        if (!existing.tags.includes('merged')) existing.tags.push('merged');
+      } else {
+        ws.transactions.push({ ...t, isPreReset: false, tags: [...(t.tags || []), 'merged'] });
+      }
+      ws.restoredEntryIds.push(t.id);
+      recovered++;
+    });
+
+    ws.mergedBackupIds.push(preview.backup.id);
+    preview.backup.mergedAt = new Date().toISOString();
+
+    const finalBalancePaise = ws.accounts.reduce((s, a) => s + calcAccountBalance(a, ws.transactions), 0);
+    ws.restoreEvents.unshift({
+      id: `MRG-${Date.now().toString(36).toUpperCase()}`,
+      backupId: preview.backup.id,
+      mode: 'MERGE',
+      previousBalancePaise: preview.currentBalancePaise,
+      recoveredAmountPaise: preview.eligibleRecoveredPaise,
+      finalBalancePaise,
+      recoveredRecordsCount: recovered,
+      skippedDuplicatesCount: skipped,
+      safetyBackupId: safety.id,
+      createdAt: new Date().toISOString()
+    });
+    logAudit('MERGE_RESTORE', `Merged ${preview.backup.id}: +${fmtMoney(preview.eligibleRecoveredPaise)} (${skipped} duplicates skipped)`);
+    saveStore();
+    return { preview, finalBalancePaise };
   }
 
   function calcTotals(txs) {
@@ -347,14 +714,15 @@
 
   function buildMonthlyReports(ws) {
     const curYM = monthKey(todayISO());
+    const activeTxs = getActiveTxs(ws);
     const monthSet = new Set([curYM]);
-    ws.transactions.forEach(t => { if (t.date) monthSet.add(monthKey(t.date)); });
+    activeTxs.forEach(t => { if (t.date) monthSet.add(monthKey(t.date)); });
     const sortedAsc = [...monthSet].sort();
     let runningOpening = ws.accounts.reduce((s, a) => s + (a.openingPaise || 0), 0);
     const reports = [];
 
     for (const ym of sortedAsc) {
-      const mTxs = ws.transactions.filter(t => monthKey(t.date) === ym);
+      const mTxs = activeTxs.filter(t => monthKey(t.date) === ym);
       const totals = calcTotals(mTxs);
       const openingPaise = runningOpening;
       const closingPaise = openingPaise + totals.net;
@@ -419,7 +787,7 @@
           <p class="text-[11px] text-[var(--text-muted)]">${topCat ? `Highest expense category: ${escapeHtml(topCat[0])} (${fmtMoney(topCat[1])})` : 'No expenses logged in this month.'}</p>
         </div>
         <div class="text-right">
-          <p class="text-lg font-extrabold tabular-nums text-[#C6A66B]">${fmtMoney(rep.savingsPaise, true)}</p>
+          <p class="text-lg font-extrabold tabular-nums text-[#1d5fbf]">${fmtMoney(rep.savingsPaise, true)}</p>
           <p class="text-[11px] text-[var(--text-muted)]">${rep.savingsRate}% savings rate</p>
         </div>
       </div>
@@ -447,7 +815,7 @@
       success: 'border-emerald-500/40 text-[#16A579]',
       warning: 'border-amber-500/40 text-amber-400',
       error: 'border-rose-500/40 text-[#D96C72]',
-      info: 'border-cyan-500/40 text-[#C6A66B]'
+      info: 'border-cyan-500/40 text-[#1d5fbf]'
     };
     const iconName = type === 'success' ? 'check-circle-2' : type === 'warning' ? 'alert-triangle' : type === 'error' ? 'x-circle' : 'info';
     const el = document.createElement('div');
@@ -476,7 +844,7 @@
     if (!ws.settings.budgetAlerts || tx.type !== 'expense') return;
     const ym = monthKey(tx.date);
     if (ym !== monthKey(todayISO())) return;
-    const monthExp = ws.transactions.filter(t => t.type === 'expense' && monthKey(t.date) === ym);
+    const monthExp = getActiveTxs(ws).filter(t => t.type === 'expense' && monthKey(t.date) === ym);
 
     const catLimit = ws.budgets.categories[tx.category];
     if (catLimit && catLimit > 0) {
@@ -566,7 +934,7 @@
     });
     document.querySelectorAll('.mob-nav-btn').forEach(btn => {
       const active = btn.dataset.view === UI.view;
-      btn.classList.toggle('text-[#C6A66B]', active);
+      btn.classList.toggle('text-[#1d5fbf]', active);
       btn.classList.toggle('text-[var(--text-muted)]', !active);
     });
 
@@ -577,6 +945,8 @@
       analytics: ['Analytics & Reports', 'Visual trends, merchant breakdown, and CSV/PDF reports'],
       calendar: ['Financial Calendar', 'Daily cash flow and upcoming recurring obligations'],
       wealth: ['Accounts, Recurring & Goals', 'Manage balances, subscriptions, and savings milestones'],
+      protocols: ['MCP & UTCP Hub', 'Unified Model Context Protocol & Universal Tool Calling Protocol router'],
+      backups: ['Backup & Recovery', '5-day encrypted reset snapshots, full restore, and duplicate-proof merge'],
       assistant: ['Smart Financial Assistant', 'Instant answers calculated directly from your real data'],
       admin: ['Workspace Admin', 'Multi-account isolation, audit trail, and system health'],
       settings: ['Settings & Data', 'Currency, theme, custom categories, and backups']
@@ -603,23 +973,27 @@
     else if (UI.view === 'analytics') renderAnalytics(main);
     else if (UI.view === 'calendar') renderCalendar(main);
     else if (UI.view === 'wealth') renderWealth(main);
+    else if (UI.view === 'protocols') renderProtocols(main);
+    else if (UI.view === 'backups') renderBackups(main);
     else if (UI.view === 'assistant') renderAssistant(main);
     else if (UI.view === 'admin') renderAdmin(main);
     else if (UI.view === 'settings') renderSettings(main);
     if (window.lucide) lucide.createIcons();
+    if (window.LedgerLiquidFX) window.LedgerLiquidFX.animateView(main);
   }
 
   // ---- VIEW 1: DASHBOARD ----
   function renderDashboard(root) {
     const ws = getActiveWorkspace();
-    const filtered = filterByDateRange(ws.transactions, UI.dateRange);
+    const activeTxs = getActiveTxs(ws);
+    const filtered = filterByDateRange(activeTxs, UI.dateRange);
     const totals = calcTotals(filtered);
     const totalBalance = ws.accounts.reduce((s, a) => s + calcAccountBalance(a, ws.transactions), 0);
 
     const curYM = monthKey(todayISO());
     const prevYM = shiftMonth(curYM, -1);
-    const curTotals = calcTotals(ws.transactions.filter(t => monthKey(t.date) === curYM));
-    const prevTotals = calcTotals(ws.transactions.filter(t => monthKey(t.date) === prevYM));
+    const curTotals = calcTotals(activeTxs.filter(t => monthKey(t.date) === curYM));
+    const prevTotals = calcTotals(activeTxs.filter(t => monthKey(t.date) === prevYM));
     const expDelta = prevTotals.expense > 0 ? Math.round(((curTotals.expense - prevTotals.expense) / prevTotals.expense) * 100) : 0;
 
     const overallLimit = ws.budgets.overallPaise || 0;
@@ -630,13 +1004,14 @@
     filtered.filter(t => t.type === 'expense').forEach(t => { catMap[t.category] = (catMap[t.category] || 0) + t.amountPaise; });
     const sortedCats = Object.entries(catMap).sort((a, b) => b[1] - a[1]);
     const topCat = sortedCats[0];
-    const recent = [...ws.transactions].sort((a, b) => b.date.localeCompare(a.date)).slice(0, 6);
+    const recent = [...activeTxs].sort((a, b) => b.date.localeCompare(a.date)).slice(0, 6);
 
     root.innerHTML = `
       <div class="view-section space-y-6">
-        <!-- Date Range Filter & Live Status -->
+        <!-- Screen Title & Date Range Filter -->
         <div class="flex flex-wrap items-center justify-between gap-3">
-          <div class="flex flex-wrap gap-1.5 p-1 rounded-xl surface-2">
+          <h1 class="text-2xl font-bold tracking-tight">Overview</h1>
+          <div class="flex flex-wrap gap-1.5 p-1 rounded-md surface-2">
             ${[
               ['this_month', 'This Month'],
               ['last_month', 'Last Month'],
@@ -649,64 +1024,63 @@
           </div>
           <div class="flex items-center gap-2 px-3 py-1.5 rounded-full surface-2 text-xs text-[var(--text-muted)]">
             <span class="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
-            <span>Live engine · <strong class="text-[var(--text)]">${ws.transactions.length}</strong> records</span>
+            <span>Live engine · <strong class="text-[var(--text)]">${activeTxs.length}</strong> active records</span>
           </div>
         </div>
 
-        <!-- KPI Spotlight Cards -->
-        <div class="grid sm:grid-cols-2 xl:grid-cols-4 gap-4">
-          <div class="card-black-glass p-5">
-            <div class="flex items-center justify-between">
-              <span class="text-xs font-medium text-neutral-300">Total Net Balance</span>
-              <span class="w-9 h-9 rounded-xl bg-white/10 text-[#C6A66B] flex items-center justify-center border border-white/15"><i data-lucide="wallet" class="w-4 h-4"></i></span>
+        <!-- KPI Ledger Strip (Achromatic Ledger: type-first, no tinted icon squares) -->
+        <div class="card grid sm:grid-cols-2 xl:grid-cols-4 divide-y sm:divide-y-0 sm:divide-x divide-[var(--border)]">
+          <div class="p-5">
+            <div class="flex items-center justify-between text-xs text-[var(--text-muted)]">
+              <span>Total Net Balance</span>
+              <i data-lucide="wallet" class="w-4 h-4 text-[var(--text-muted)]"></i>
             </div>
-            <p id="kpi-balance" class="text-2xl sm:text-3xl font-extrabold tabular-nums mt-3 tracking-tight text-white">${fmtMoney(totalBalance)}</p>
-            <p class="text-xs text-neutral-400 mt-1.5">Across ${ws.accounts.length} active accounts</p>
+            <p id="kpi-balance" class="text-2xl sm:text-[30px] font-bold tabular-nums mt-2 tracking-tight text-[var(--text)]">${fmtMoney(totalBalance)}</p>
+            <p class="text-xs text-[var(--text-muted)] mt-1.5">Across ${ws.accounts.length} active accounts</p>
           </div>
 
-          <div class="card card-hover kpi-accent-emerald p-5">
-            <div class="flex items-center justify-between">
-              <span class="text-xs font-medium text-[var(--text-muted)]">Total Income</span>
-              <span class="w-9 h-9 rounded-xl bg-[#16A579]/15 text-[#16A579] flex items-center justify-center border border-[#16A579]/30"><i data-lucide="trending-up" class="w-4 h-4"></i></span>
+          <div class="p-5">
+            <div class="flex items-center justify-between text-xs text-[var(--text-muted)]">
+              <span>Total Income</span>
+              <i data-lucide="trending-up" class="w-4 h-4 text-[var(--text-muted)]"></i>
             </div>
-            <p id="kpi-income" class="text-2xl sm:text-3xl font-extrabold tabular-nums text-[#16A579] mt-3 tracking-tight">${fmtMoney(totals.income)}</p>
-            <p class="text-xs text-[var(--text-muted)] mt-1.5">${filtered.filter(t => t.type === 'income').length} income entries</p>
+            <p id="kpi-income" class="text-2xl sm:text-[30px] font-bold tabular-nums text-[var(--text)] mt-2 tracking-tight">${fmtMoney(totals.income)}</p>
+            <p class="text-xs text-[#2e7d32] mt-1.5">${filtered.filter(t => t.type === 'income').length} income entries</p>
           </div>
 
-          <div class="card card-hover kpi-accent-rose p-5">
-            <div class="flex items-center justify-between">
-              <span class="text-xs font-medium text-[var(--text-muted)]">Total Expenses</span>
-              <span class="w-9 h-9 rounded-xl bg-[#D96C72]/15 text-[#D96C72] flex items-center justify-center border border-[#D96C72]/30"><i data-lucide="trending-down" class="w-4 h-4"></i></span>
+          <div class="p-5">
+            <div class="flex items-center justify-between text-xs text-[var(--text-muted)]">
+              <span>Total Expenses</span>
+              <i data-lucide="trending-down" class="w-4 h-4 text-[var(--text-muted)]"></i>
             </div>
-            <p id="kpi-expense" class="text-2xl sm:text-3xl font-extrabold tabular-nums text-[#D96C72] mt-3 tracking-tight">${fmtMoney(totals.expense)}</p>
-            <p class="text-xs mt-1.5 font-medium ${expDelta <= 0 ? 'text-[#16A579]' : 'text-[#D96C72]'}">${expDelta === 0 ? 'Steady vs last month' : (expDelta > 0 ? `+${expDelta}% vs last month` : `${expDelta}% vs last month`)}</p>
+            <p id="kpi-expense" class="text-2xl sm:text-[30px] font-bold tabular-nums text-[var(--text)] mt-2 tracking-tight">${fmtMoney(totals.expense)}</p>
+            <p class="text-xs mt-1.5 font-medium ${expDelta <= 0 ? 'text-[#2e7d32]' : 'text-[#c4242a]'}">${expDelta === 0 ? 'Steady vs last month' : (expDelta > 0 ? `+${expDelta}% vs last month` : `${expDelta}% vs last month`)}</p>
           </div>
 
-          <div class="card card-hover kpi-accent-cyan p-5">
-            <div class="flex items-center justify-between">
-              <span class="text-xs font-medium text-[var(--text-muted)]">Net Savings</span>
-              <span class="w-9 h-9 rounded-xl bg-[#16A579]/15 text-[#C6A66B] flex items-center justify-center border border-[#16A579]/30"><i data-lucide="piggy-bank" class="w-4 h-4"></i></span>
+          <div class="p-5">
+            <div class="flex items-center justify-between text-xs text-[var(--text-muted)]">
+              <span>Net Savings</span>
+              <i data-lucide="piggy-bank" class="w-4 h-4 text-[var(--text-muted)]"></i>
             </div>
-            <p id="kpi-savings" class="text-2xl sm:text-3xl font-extrabold tabular-nums mt-3 tracking-tight ${totals.net >= 0 ? 'text-[#C6A66B]' : 'text-[#D96C72]'}">${fmtMoney(totals.net, true)}</p>
+            <p id="kpi-savings" class="text-2xl sm:text-[30px] font-bold tabular-nums mt-2 tracking-tight ${totals.net >= 0 ? 'text-[var(--text)]' : 'text-[#c4242a]'}">${fmtMoney(totals.net, true)}</p>
             <p class="text-xs text-[var(--text-muted)] mt-1.5">Savings rate: <strong class="text-[var(--text)] tabular-nums">${totals.savingsRate}%</strong></p>
           </div>
         </div>
 
-        <!-- Luxury Account Cards & Quick Actions Strip (Ref Page 1) -->
-        <div class="grid lg:grid-cols-12 gap-4 items-stretch">
+        <!-- Account Balances & Quick Actions -->
+        <div class="grid lg:grid-cols-12 gap-3 items-start">
           <div class="lg:col-span-8 grid sm:grid-cols-2 xl:grid-cols-4 gap-3">
-            ${ws.accounts.slice(0, 4).map((acc, idx) => {
+            ${ws.accounts.slice(0, 4).map((acc) => {
               const bal = calcAccountBalance(acc, ws.transactions);
-              const isObs = idx === 0;
               return `
-                <div class="${isObs ? 'metal-card-obsidian' : 'metal-card'} rounded-2xl p-4 flex flex-col justify-between min-h-[108px] transition-transform hover:-translate-y-0.5">
+                <div class="card p-4 flex flex-col justify-between min-h-[100px]">
                   <div class="flex items-center justify-between gap-2">
-                    <span class="text-[11px] font-semibold truncate ${isObs ? 'text-neutral-300' : 'text-[var(--text-muted)]'}">${escapeHtml(acc.name)}</span>
-                    <span class="px-2 py-0.5 rounded-full text-[10px] font-semibold bg-[#16A579]/15 text-[#16A579] shrink-0">Active</span>
+                    <span class="text-xs font-medium text-[var(--text-muted)] truncate">${escapeHtml(acc.name)}</span>
+                    <span class="px-2 py-0.5 rounded text-xs font-medium bg-[var(--pill-positive-bg)] text-[var(--pill-positive-ink)] shrink-0">Active</span>
                   </div>
                   <div class="mt-3">
-                    <p class="text-base font-extrabold tabular-nums ${isObs ? 'text-white' : 'text-[var(--text)]'}">${fmtMoney(bal)}</p>
-                    <p class="text-[10px] mt-0.5 ${isObs ? 'text-[#C6A66B]' : 'text-[var(--text-muted)]'}">${escapeHtml(acc.type)}</p>
+                    <p class="text-base font-bold tabular-nums ${bal === 0 ? 'text-[var(--text-muted)]' : 'text-[var(--text)]'}">${fmtMoney(bal)}</p>
+                    <p class="text-xs mt-0.5 text-[var(--text-muted)]">${escapeHtml(acc.type)}</p>
                   </div>
                 </div>
               `;
@@ -715,13 +1089,13 @@
           <div class="card p-4 lg:col-span-4 flex flex-col justify-between gap-3">
             <div class="flex items-center justify-between">
               <span class="text-xs font-semibold">Quick Actions</span>
-              <span class="text-[10px] uppercase tracking-wider text-[#C6A66B] font-semibold">Instant</span>
+              <span class="text-xs text-[var(--text-muted)]">Shortcut</span>
             </div>
             <div class="grid grid-cols-2 gap-2">
-              <button type="button" id="qa-add-exp" class="px-3 py-2 rounded-xl surface-2 hover:border-[#C6A66B]/60 text-xs font-semibold flex items-center justify-center gap-1.5"><i data-lucide="minus-circle" class="w-3.5 h-3.5 text-[#D96C72]"></i>Expense</button>
-              <button type="button" id="qa-add-inc" class="px-3 py-2 rounded-xl surface-2 hover:border-[#16A579]/60 text-xs font-semibold flex items-center justify-center gap-1.5"><i data-lucide="plus-circle" class="w-3.5 h-3.5 text-[#16A579]"></i>Income</button>
-              <button type="button" id="qa-set-limits" class="px-3 py-2 rounded-xl surface-2 hover:border-[#C6A66B]/60 text-xs font-semibold flex items-center justify-center gap-1.5"><i data-lucide="sliders-horizontal" class="w-3.5 h-3.5 text-[#C6A66B]"></i>Limits</button>
-              <button type="button" id="qa-export-csv" class="px-3 py-2 rounded-xl surface-2 hover:border-[#101114]/40 text-xs font-semibold flex items-center justify-center gap-1.5"><i data-lucide="download" class="w-3.5 h-3.5"></i>Export</button>
+              <button type="button" id="qa-add-exp" class="btn-secondary px-3 py-2 text-xs flex items-center justify-center gap-1.5"><i data-lucide="minus-circle" class="w-3.5 h-3.5 text-[#c4242a]"></i>Expense</button>
+              <button type="button" id="qa-add-inc" class="btn-secondary px-3 py-2 text-xs flex items-center justify-center gap-1.5"><i data-lucide="plus-circle" class="w-3.5 h-3.5 text-[#2e7d32]"></i>Income</button>
+              <button type="button" id="qa-set-limits" class="btn-secondary px-3 py-2 text-xs flex items-center justify-center gap-1.5"><i data-lucide="sliders-horizontal" class="w-3.5 h-3.5"></i>Limits</button>
+              <button type="button" id="qa-export-csv" class="btn-secondary px-3 py-2 text-xs flex items-center justify-center gap-1.5"><i data-lucide="download" class="w-3.5 h-3.5"></i>Export</button>
             </div>
           </div>
         </div>
@@ -729,8 +1103,8 @@
         <!-- Monthly Budget Guardrail -->
         <div class="card p-5">
           <div class="flex flex-wrap items-center justify-between gap-2 mb-3">
-            <div class="flex items-center gap-2.5">
-              <span class="w-7 h-7 rounded-lg bg-[#C6A66B]/15 text-[#C6A66B] flex items-center justify-center"><i data-lucide="target" class="w-4 h-4"></i></span>
+            <div class="flex items-center gap-2">
+              <i data-lucide="target" class="w-4 h-4 text-[var(--text)]"></i>
               <h2 class="text-sm font-semibold">Monthly Budget Guardrail (${monthLabel(curYM)})</h2>
             </div>
             <div class="text-xs tabular-nums">
@@ -743,7 +1117,7 @@
           </div>
           <div class="flex flex-wrap items-center justify-between gap-2 mt-2.5 text-xs text-[var(--text-muted)]">
             <span>${overallLimit - curTotals.expense >= 0 ? `${fmtMoney(overallLimit - curTotals.expense)} remaining this month` : `Exceeded by ${fmtMoney(curTotals.expense - overallLimit)}`}</span>
-            <button type="button" id="dash-go-budgets" class="text-[#C6A66B] hover:text-[#C6A66B] font-semibold transition-colors">Manage Budgets →</button>
+            <button type="button" id="dash-go-budgets" class="text-[#1d5fbf] hover:text-[#1d5fbf] font-semibold transition-colors">Manage Budgets →</button>
           </div>
         </div>
 
@@ -755,7 +1129,7 @@
                 <h2 class="text-sm font-semibold">Income vs Expenses</h2>
                 <p class="text-xs text-[var(--text-muted)]">6-month cash flow trajectory</p>
               </div>
-              <span class="px-2.5 py-1 rounded-full text-[10px] font-semibold surface-2 text-[#C6A66B]">6M Trend</span>
+              <span class="px-2.5 py-1 rounded-full text-xs font-semibold surface-2 text-[#1d5fbf]">6M Trend</span>
             </div>
             <div class="relative h-72"><canvas id="dash-cashflow-chart"></canvas></div>
           </div>
@@ -786,14 +1160,14 @@
           <div class="card p-5 lg:col-span-7">
             <div class="flex items-center justify-between mb-4">
               <h2 class="text-sm font-semibold">Recent Transactions</h2>
-              <button type="button" id="dash-view-all-tx" class="text-xs font-semibold text-[#C6A66B] hover:text-[#C6A66B] transition-colors">View All →</button>
+              <button type="button" id="dash-view-all-tx" class="text-xs font-semibold text-[#1d5fbf] hover:text-[#1d5fbf] transition-colors">View All →</button>
             </div>
             ${recent.length ? `
               <div class="divide-y divide-[var(--border)]">
                 ${recent.map(tx => `
                   <div class="py-3 flex items-center justify-between gap-3 hover:bg-[var(--surface-2)]/30 px-2 -mx-2 rounded-xl transition-colors">
                     <div class="flex items-center gap-3 min-w-0">
-                      <div class="w-9 h-9 rounded-xl flex items-center justify-center shrink-0 ${tx.type === 'income' ? 'bg-[#16A579]/15 text-[#16A579]' : tx.type === 'transfer' ? 'bg-[#C6A66B]/15 text-[#C6A66B]' : 'bg-[#D96C72]/15 text-[#D96C72]'}">
+                      <div class="w-9 h-9 rounded-xl flex items-center justify-center shrink-0 ${tx.type === 'income' ? 'bg-[#16A579]/15 text-[#16A579]' : tx.type === 'transfer' ? 'bg-[#C6A66B]/15 text-[#1d5fbf]' : 'bg-[#D96C72]/15 text-[#D96C72]'}">
                         <i data-lucide="${tx.type === 'income' ? 'arrow-down-left' : tx.type === 'transfer' ? 'repeat' : 'arrow-up-right'}" class="w-4 h-4"></i>
                       </div>
                       <div class="min-w-0">
@@ -802,7 +1176,7 @@
                       </div>
                     </div>
                     <div class="text-right shrink-0">
-                      <p class="text-sm font-bold tabular-nums ${tx.type === 'income' ? 'text-[#16A579]' : tx.type === 'transfer' ? 'text-[#C6A66B]' : 'text-[var(--text)]'}">${tx.type === 'income' ? '+' : tx.type === 'expense' ? '-' : ''}${fmtMoney(tx.amountPaise)}</p>
+                      <p class="text-sm font-bold tabular-nums ${tx.type === 'income' ? 'text-[#16A579]' : tx.type === 'transfer' ? 'text-[#1d5fbf]' : 'text-[var(--text)]'}">${tx.type === 'income' ? '+' : tx.type === 'expense' ? '-' : ''}${fmtMoney(tx.amountPaise)}</p>
                     </div>
                   </div>
                 `).join('')}
@@ -812,8 +1186,8 @@
 
           <div class="card p-5 lg:col-span-5 space-y-4">
             <div class="flex items-center justify-between">
-              <h2 class="text-sm font-semibold flex items-center gap-2"><i data-lucide="sparkles" class="w-4 h-4 text-[#C6A66B]"></i>Smart Insights</h2>
-              <button type="button" id="dash-open-assistant" class="text-xs font-semibold text-[#C6A66B] hover:text-[#C6A66B] transition-colors">Ask AI →</button>
+              <h2 class="text-sm font-semibold flex items-center gap-2"><i data-lucide="sparkles" class="w-4 h-4 text-[#1d5fbf]"></i>Smart Insights</h2>
+              <button type="button" id="dash-open-assistant" class="text-xs font-semibold text-[#1d5fbf] hover:text-[#1d5fbf] transition-colors">Ask AI →</button>
             </div>
             <div class="space-y-3 text-xs leading-relaxed">
               <div class="surface-2 p-3.5 rounded-xl border-l-2 border-l-[#111111]">
@@ -836,7 +1210,7 @@
         <div class="card p-5 space-y-4">
           <div class="flex flex-wrap items-center justify-between gap-3">
             <div>
-              <h2 class="text-sm font-bold flex items-center gap-2"><i data-lucide="file-text" class="w-4 h-4 text-[#C6A66B]"></i>Monthly Financial Reports</h2>
+              <h2 class="text-sm font-bold flex items-center gap-2"><i data-lucide="file-text" class="w-4 h-4 text-[#1d5fbf]"></i>Monthly Financial Reports</h2>
               <p class="text-xs text-[var(--text-muted)]">Account-isolated monthly statements for <strong>${escapeHtml(ws.profile.email)}</strong> · Email reports: <span class="font-semibold text-[var(--text)]">${ws.settings.emailReportsEnabled ? 'Enabled' : 'Off'}</span></p>
             </div>
             <div class="relative w-full sm:w-56">
@@ -852,12 +1226,12 @@
                     <p class="text-sm font-bold">${escapeHtml(r.label)}</p>
                     <p class="text-[11px] text-[var(--text-muted)]">${r.txCount} transactions · Closing ${fmtMoney(r.closingPaise)}</p>
                   </div>
-                  <span class="px-2 py-0.5 rounded-full text-[10px] font-semibold ${r.isCurrent ? 'bg-[#C6A66B]/20 text-[#C6A66B]' : 'bg-[#16A579]/15 text-[#16A579]'}">${escapeHtml(r.emailStatus)}</span>
+                  <span class="px-2 py-0.5 rounded-full text-xs font-semibold ${r.isCurrent ? 'bg-[#C6A66B]/20 text-[#1d5fbf]' : 'bg-[#16A579]/15 text-[#16A579]'}">${escapeHtml(r.emailStatus)}</span>
                 </div>
                 <div class="grid grid-cols-3 gap-2 text-xs tabular-nums">
-                  <div><p class="text-[10px] text-[var(--text-muted)]">Income</p><p class="font-bold text-[#16A579]">${fmtMoney(r.incomePaise)}</p></div>
-                  <div><p class="text-[10px] text-[var(--text-muted)]">Expense</p><p class="font-bold text-[#D96C72]">${fmtMoney(r.expensePaise)}</p></div>
-                  <div><p class="text-[10px] text-[var(--text-muted)]">Savings</p><p class="font-bold">${r.savingsRate}%</p></div>
+                  <div><p class="text-xs text-[var(--text-muted)]">Income</p><p class="font-bold text-[#16A579]">${fmtMoney(r.incomePaise)}</p></div>
+                  <div><p class="text-xs text-[var(--text-muted)]">Expense</p><p class="font-bold text-[#D96C72]">${fmtMoney(r.expensePaise)}</p></div>
+                  <div><p class="text-xs text-[var(--text-muted)]">Savings</p><p class="font-bold">${r.savingsRate}%</p></div>
                 </div>
                 <div class="flex flex-wrap gap-1.5 pt-2 border-t border-[var(--border)]">
                   <button type="button" data-view-rep="${r.ym}" class="px-2.5 py-1 rounded-lg btn-primary text-[11px] font-semibold">View Report</button>
@@ -921,8 +1295,8 @@
     const textColor = isDark ? '#94A3C0' : '#5A607D';
     const months = [];
     for (let i = 5; i >= 0; i--) months.push(shiftMonth(curYM, -i));
-    const incSeries = months.map(m => fromPaise(ws.transactions.filter(t => t.type === 'income' && monthKey(t.date) === m).reduce((s, t) => s + t.amountPaise, 0)));
-    const expSeries = months.map(m => fromPaise(ws.transactions.filter(t => t.type === 'expense' && monthKey(t.date) === m).reduce((s, t) => s + t.amountPaise, 0)));
+    const incSeries = months.map(m => fromPaise(activeTxs.filter(t => t.type === 'income' && monthKey(t.date) === m).reduce((s, t) => s + t.amountPaise, 0)));
+    const expSeries = months.map(m => fromPaise(activeTxs.filter(t => t.type === 'expense' && monthKey(t.date) === m).reduce((s, t) => s + t.amountPaise, 0)));
 
     const cfCtx = document.getElementById('dash-cashflow-chart');
     if (cfCtx && window.Chart) {
@@ -1016,6 +1390,8 @@
 
     const filteredTotals = calcTotals(list);
     const accMap = Object.fromEntries(ws.accounts.map(a => [a.id, a.name]));
+    const windowLimit = UI.txWindowLimit || 60;
+    const visibleList = list.slice(0, windowLimit);
 
     root.innerHTML = `
       <div class="view-section space-y-5">
@@ -1026,10 +1402,10 @@
               <input id="tx-search-input" type="text" value="${escapeHtml(f.search)}" placeholder="Search merchant, notes, tags..." class="input-field w-full pl-9 pr-3 py-2 text-sm" />
             </div>
             <button id="tx-export-csv" type="button" class="px-3.5 py-2 rounded-xl surface-2 text-xs font-semibold hover:border-[#111111]/30 flex items-center gap-1.5">
-              <i data-lucide="download" class="w-3.5 h-3.5 text-[#C6A66B]"></i>Export CSV
+              <i data-lucide="download" class="w-3.5 h-3.5 text-[#1d5fbf]"></i>Export CSV
             </button>
             <button id="tx-import-csv" type="button" class="px-3.5 py-2 rounded-xl surface-2 text-xs font-semibold hover:border-[#111111]/30 flex items-center gap-1.5">
-              <i data-lucide="upload" class="w-3.5 h-3.5 text-[#C6A66B]"></i>Import CSV
+              <i data-lucide="upload" class="w-3.5 h-3.5 text-[#1d5fbf]"></i>Import CSV
             </button>
           </div>
           <div class="grid grid-cols-2 sm:grid-cols-5 gap-2.5">
@@ -1064,7 +1440,7 @@
               <span class="text-[#16A579] font-semibold">In: ${fmtMoney(filteredTotals.income)}</span>
               <span class="text-[#D96C72] font-semibold">Out: ${fmtMoney(filteredTotals.expense)}</span>
             </div>
-            ${(f.search || f.type !== 'all' || f.category !== 'all' || f.method !== 'all' || f.account !== 'all') ? `<button id="tx-reset-filters" type="button" class="text-[#C6A66B] hover:text-[#C6A66B] font-semibold">Clear Filters</button>` : ''}
+            ${(f.search || f.type !== 'all' || f.category !== 'all' || f.method !== 'all' || f.account !== 'all') ? `<button id="tx-reset-filters" type="button" class="text-[#1d5fbf] hover:text-[#1d5fbf] font-semibold">Clear Filters</button>` : ''}
           </div>
         </div>
 
@@ -1083,15 +1459,15 @@
                   </tr>
                 </thead>
                 <tbody class="divide-y divide-[var(--border)] text-sm">
-                  ${list.map(tx => `
+                  ${visibleList.map(tx => `
                     <tr class="hover:bg-[var(--surface-2)]/40 transition-colors">
                       <td class="py-3.5 px-4">
                         <div class="flex items-center gap-3">
                           <span class="w-2.5 h-2.5 rounded-full shrink-0" style="background:${tx.type === 'transfer' ? '#8B5CF6' : getCategoryColor(ws, tx.category, tx.type)}"></span>
                           <div class="min-w-0">
-                            <p class="font-medium truncate max-w-[200px] sm:max-w-[260px]">${escapeHtml(tx.title)}</p>
+                            <p class="font-medium truncate max-w-[200px] sm:max-w-[260px]">${escapeHtml(tx.title)} ${tx.isPreReset ? `<span class="ml-1.5 px-1.5 py-0.5 rounded text-xs bg-[var(--pill-neutral-bg)] text-[var(--pill-neutral-ink)]">Pre-Reset</span>` : ''}</p>
                             <p class="text-xs text-[var(--text-muted)] sm:hidden">${escapeHtml(tx.category)} · ${formatDateDisplay(tx.date)}</p>
-                            ${tx.tags && tx.tags.length ? `<div class="flex flex-wrap gap-1 mt-1">${tx.tags.map(tg => `<span class="px-1.5 py-0.5 rounded text-[10px] surface-2 text-[var(--text-muted)]">#${escapeHtml(tg)}</span>`).join('')}</div>` : ''}
+                            ${tx.tags && tx.tags.length ? `<div class="flex flex-wrap gap-1 mt-1">${tx.tags.map(tg => `<span class="px-1.5 py-0.5 rounded text-xs surface-2 text-[var(--text-muted)]">#${escapeHtml(tg)}</span>`).join('')}</div>` : ''}
                           </div>
                         </div>
                       </td>
@@ -1103,12 +1479,12 @@
                         <p>${escapeHtml(tx.method)}</p>
                       </td>
                       <td class="py-3.5 px-4 hidden sm:table-cell text-xs text-[var(--text-muted)] tabular-nums">${formatDateDisplay(tx.date)}</td>
-                      <td class="py-3.5 px-4 text-right font-bold tabular-nums whitespace-nowrap ${tx.type === 'income' ? 'text-[#16A579]' : tx.type === 'transfer' ? 'text-[#C6A66B]' : 'text-[var(--text)]'}">
+                      <td class="py-3.5 px-4 text-right font-bold tabular-nums whitespace-nowrap ${tx.type === 'income' ? 'text-[#16A579]' : tx.type === 'transfer' ? 'text-[#1d5fbf]' : 'text-[var(--text)]'}">
                         ${tx.type === 'income' ? '+' : tx.type === 'expense' ? '-' : ''}${fmtMoney(tx.amountPaise)}
                       </td>
                       <td class="py-3.5 px-4 text-right whitespace-nowrap">
-                        <button type="button" data-edit-tx="${tx.id}" class="p-1.5 rounded-lg hover:bg-[#C6A66B]/15 text-[var(--text-muted)] hover:text-[#C6A66B]" title="Edit" aria-label="Edit transaction"><i data-lucide="pencil" class="w-3.5 h-3.5"></i></button>
-                        <button type="button" data-dup-tx="${tx.id}" class="p-1.5 rounded-lg hover:bg-[#16A579]/15 text-[var(--text-muted)] hover:text-[#C6A66B]" title="Duplicate" aria-label="Duplicate transaction"><i data-lucide="copy" class="w-3.5 h-3.5"></i></button>
+                        <button type="button" data-edit-tx="${tx.id}" class="p-1.5 rounded-lg hover:bg-[#C6A66B]/15 text-[var(--text-muted)] hover:text-[#1d5fbf]" title="Edit" aria-label="Edit transaction"><i data-lucide="pencil" class="w-3.5 h-3.5"></i></button>
+                        <button type="button" data-dup-tx="${tx.id}" class="p-1.5 rounded-lg hover:bg-[#16A579]/15 text-[var(--text-muted)] hover:text-[#1d5fbf]" title="Duplicate" aria-label="Duplicate transaction"><i data-lucide="copy" class="w-3.5 h-3.5"></i></button>
                         <button type="button" data-del-tx="${tx.id}" class="p-1.5 rounded-lg hover:bg-rose-500/15 text-[var(--text-muted)] hover:text-[#D96C72]" title="Delete" aria-label="Delete transaction"><i data-lucide="trash-2" class="w-3.5 h-3.5"></i></button>
                       </td>
                     </tr>
@@ -1116,6 +1492,12 @@
                 </tbody>
               </table>
             </div>
+            ${list.length > visibleList.length ? `
+              <div class="p-3 border-t border-[var(--border-subtle)] flex items-center justify-between text-xs">
+                <span class="text-[var(--text-muted)]">Showing ${visibleList.length} of ${list.length} records (virtualized window)</span>
+                <button id="tx-load-more" type="button" class="btn-secondary px-3 py-1.5 text-xs">Load next 60 records</button>
+              </div>
+            ` : ''}
           ` : `
             <div class="p-12 text-center space-y-2">
               <div class="w-12 h-12 rounded-2xl surface-2 mx-auto flex items-center justify-center text-[var(--text-muted)]"><i data-lucide="inbox" class="w-6 h-6"></i></div>
@@ -1128,14 +1510,29 @@
     `;
 
     const searchEl = document.getElementById('tx-search-input');
+    let searchTimer = null;
     searchEl.addEventListener('input', e => {
       UI.txFilters.search = e.target.value;
-      renderTransactions(root);
-      if (window.lucide) lucide.createIcons();
-      const el = document.getElementById('tx-search-input');
-      el.focus();
-      el.setSelectionRange(el.value.length, el.value.length);
+      UI.txWindowLimit = 60;
+      clearTimeout(searchTimer);
+      searchTimer = setTimeout(() => {
+        renderTransactions(root);
+        if (window.lucide) lucide.createIcons();
+        const el = document.getElementById('tx-search-input');
+        if (el) {
+          el.focus();
+          el.setSelectionRange(el.value.length, el.value.length);
+        }
+      }, 150);
     });
+    const loadMoreBtn = document.getElementById('tx-load-more');
+    if (loadMoreBtn) {
+      loadMoreBtn.addEventListener('click', () => {
+        UI.txWindowLimit = (UI.txWindowLimit || 60) + 60;
+        renderTransactions(root);
+        if (window.lucide) lucide.createIcons();
+      });
+    }
     document.getElementById('tx-f-type').addEventListener('change', e => { UI.txFilters.type = e.target.value; renderApp(); });
     document.getElementById('tx-f-cat').addEventListener('change', e => { UI.txFilters.category = e.target.value; renderApp(); });
     document.getElementById('tx-f-method').addEventListener('change', e => { UI.txFilters.method = e.target.value; renderApp(); });
@@ -1183,7 +1580,7 @@
   function renderBudgets(root) {
     const ws = getActiveWorkspace();
     const ym = UI.budgetMonth;
-    const monthExp = ws.transactions.filter(t => t.type === 'expense' && monthKey(t.date) === ym);
+    const monthExp = getActiveTxs(ws).filter(t => t.type === 'expense' && monthKey(t.date) === ym);
     const totalSpent = monthExp.reduce((s, t) => s + t.amountPaise, 0);
     const overall = ws.budgets.overallPaise || 0;
     const overallPct = overall > 0 ? Math.round((totalSpent / overall) * 100) : 0;
@@ -1192,7 +1589,7 @@
       if (pct >= 100) return `<span class="px-2 py-0.5 rounded-full text-[11px] font-semibold bg-rose-500/20 text-[#D96C72]">Exceeded (${pct}%)</span>`;
       if (pct >= 90) return `<span class="px-2 py-0.5 rounded-full text-[11px] font-semibold bg-[#D96C72]/15 text-[#D96C72]">Critical (${pct}%)</span>`;
       if (pct >= 75) return `<span class="px-2 py-0.5 rounded-full text-[11px] font-semibold bg-amber-500/20 text-amber-400">Warning (${pct}%)</span>`;
-      if (pct >= 50) return `<span class="px-2 py-0.5 rounded-full text-[11px] font-semibold bg-[#C6A66B]/20 text-[#C6A66B]">On Track (${pct}%)</span>`;
+      if (pct >= 50) return `<span class="px-2 py-0.5 rounded-full text-[11px] font-semibold bg-[#C6A66B]/20 text-[#1d5fbf]">On Track (${pct}%)</span>`;
       return `<span class="px-2 py-0.5 rounded-full text-[11px] font-semibold bg-emerald-500/20 text-[#16A579]">Healthy (${pct}%)</span>`;
     };
     const barColor = pct => pct >= 100 ? 'bg-rose-500' : pct >= 75 ? 'bg-amber-500' : 'progress-glow';
@@ -1291,7 +1688,7 @@
   function renderAnalytics(root) {
     const ws = getActiveWorkspace();
     const curYM = monthKey(todayISO());
-    const monthTxs = ws.transactions.filter(t => monthKey(t.date) === curYM);
+    const monthTxs = getActiveTxs(ws).filter(t => monthKey(t.date) === curYM);
     const totals = calcTotals(monthTxs);
 
     const methodMap = {}, merchantMap = {}, catMap = {};
@@ -1332,7 +1729,7 @@
           </div>
           <div class="card kpi-accent-cyan p-4">
             <p class="text-xs text-[var(--text-muted)]">Net Cash Flow</p>
-            <p class="text-xl font-bold tabular-nums mt-1 ${totals.net >= 0 ? 'text-[#C6A66B]' : 'text-[#D96C72]'}">${fmtMoney(totals.net, true)} (${totals.savingsRate}%)</p>
+            <p class="text-xl font-bold tabular-nums mt-1 ${totals.net >= 0 ? 'text-[#1d5fbf]' : 'text-[#D96C72]'}">${fmtMoney(totals.net, true)} (${totals.savingsRate}%)</p>
           </div>
         </div>
 
@@ -1473,7 +1870,8 @@
     const daysInMonth = new Date(year, month, 0).getDate();
 
     const dayTotals = {};
-    ws.transactions.forEach(t => {
+    const activeTxs = getActiveTxs(ws);
+    activeTxs.forEach(t => {
       if (monthKey(t.date) === ym) {
         if (!dayTotals[t.date]) dayTotals[t.date] = { inc: 0, exp: 0 };
         if (t.type === 'income') dayTotals[t.date].inc += t.amountPaise;
@@ -1481,7 +1879,7 @@
       }
     });
 
-    const selectedTxs = ws.transactions.filter(t => t.date === UI.calSelectedDate);
+    const selectedTxs = activeTxs.filter(t => t.date === UI.calSelectedDate);
     let cells = '';
     for (let i = 0; i < firstDow; i++) cells += `<div class="h-16 sm:h-20 rounded-xl bg-transparent"></div>`;
     for (let d = 1; d <= daysInMonth; d++) {
@@ -1492,7 +1890,7 @@
       cells += `
         <button type="button" data-cal-day="${iso}" class="h-16 sm:h-20 p-1.5 rounded-xl border text-left flex flex-col justify-between transition-all ${isSelected ? 'border-violet-500 bg-[#C6A66B]/15 shadow-inner' : 'border-[var(--border)] bg-[var(--surface-2)]/40 hover:border-[#111111]/30'}">
           <span class="text-xs font-semibold ${isToday ? 'px-1.5 py-0.5 rounded-md btn-primary' : ''}">${d}</span>
-          <div class="space-y-0.5 text-[10px] tabular-nums truncate w-full">
+          <div class="space-y-0.5 text-xs tabular-nums truncate w-full">
             ${info && info.inc > 0 ? `<div class="text-[#16A579] font-semibold truncate">+${fmtMoney(info.inc)}</div>` : ''}
             ${info && info.exp > 0 ? `<div class="text-[#D96C72] font-semibold truncate">-${fmtMoney(info.exp)}</div>` : ''}
           </div>
@@ -1605,7 +2003,7 @@
                   <div>
                     <div class="flex items-center gap-2">
                       <p class="text-sm font-semibold">${escapeHtml(r.title)}</p>
-                      <span class="px-2 py-0.5 rounded-full text-[10px] font-semibold ${r.active ? 'bg-emerald-500/20 text-[#16A579]' : 'bg-slate-500/20 text-slate-400'}">${r.active ? r.frequency : 'Paused'}</span>
+                      <span class="px-2 py-0.5 rounded-full text-xs font-semibold ${r.active ? 'bg-emerald-500/20 text-[#16A579]' : 'bg-slate-500/20 text-slate-400'}">${r.active ? r.frequency : 'Paused'}</span>
                     </div>
                     <p class="text-xs text-[var(--text-muted)] mt-0.5">${escapeHtml(r.category)} · Next due: ${formatDateDisplay(r.nextDate)}</p>
                   </div>
@@ -1647,7 +2045,7 @@
                       <h3 class="font-bold text-sm">${escapeHtml(g.name)}</h3>
                       <p class="text-xs text-[var(--text-muted)]">Target date: ${formatDateDisplay(g.deadline)}</p>
                     </div>
-                    <span class="px-2 py-0.5 rounded-full text-xs font-bold bg-[#C6A66B]/20 text-[#C6A66B] tabular-nums">${pct}%</span>
+                    <span class="px-2 py-0.5 rounded-full text-xs font-bold bg-[#C6A66B]/20 text-[#1d5fbf] tabular-nums">${pct}%</span>
                   </div>
                   <div class="space-y-1.5">
                     <div class="flex justify-between text-xs tabular-nums">
@@ -1772,8 +2170,9 @@
     const q = query.toLowerCase();
     const curYM = monthKey(todayISO());
     const prevYM = shiftMonth(curYM, -1);
-    const curTxs = ws.transactions.filter(t => monthKey(t.date) === curYM);
-    const prevTxs = ws.transactions.filter(t => monthKey(t.date) === prevYM);
+    const activeTxs = getActiveTxs(ws);
+    const curTxs = activeTxs.filter(t => monthKey(t.date) === curYM);
+    const prevTxs = activeTxs.filter(t => monthKey(t.date) === prevYM);
     const cur = calcTotals(curTxs);
     const prev = calcTotals(prevTxs);
 
@@ -1870,6 +2269,529 @@
     });
   }
 
+  // ---- VIEW 7B: MCP + UTCP HYBRID PROTOCOL HUB ----
+  function renderProtocols(root) {
+    root.innerHTML = `
+      <div class="view-section space-y-4">
+        <div class="grid sm:grid-cols-3 gap-3">
+          <div class="card p-4">
+            <p class="text-xs text-[var(--text-muted)]">UTCP Discovery</p>
+            <p class="text-lg font-bold mono-font mt-1">/utcp-manual.json</p>
+            <p class="text-xs text-[#2e7d32] mt-1">UTCP v1.0.1 · HTTP Call Templates</p>
+          </div>
+          <div class="card p-4">
+            <p class="text-xs text-[var(--text-muted)]">MCP Control Plane</p>
+            <p class="text-lg font-bold mono-font mt-1">ledgerflow-control</p>
+            <p class="text-xs text-[var(--text-muted)] mt-1">stdio + @utcp/mcp-bridge</p>
+          </div>
+          <div class="card p-4">
+            <p class="text-xs text-[var(--text-muted)]">OpenAPI Specification</p>
+            <p class="text-lg font-bold mono-font mt-1">/openapi.json</p>
+            <p class="text-xs text-[#1d5fbf] mt-1">OpenAPI 3.1.0 · SSRF Guarded</p>
+          </div>
+        </div>
+
+        <div class="grid lg:grid-cols-12 gap-4">
+          <div class="card p-5 lg:col-span-7 space-y-3">
+            <div class="flex items-center justify-between">
+              <h2 class="text-sm font-bold">UTCP v1.0.1 Tool Manual &amp; MCP Catalog</h2>
+              <div class="flex items-center gap-2">
+                <a href="/utcp-manual.json" target="_blank" class="btn-secondary px-2.5 py-1 text-xs mono-font">utcp-manual.json</a>
+                <a href="/openapi.json" target="_blank" class="btn-secondary px-2.5 py-1 text-xs mono-font">openapi.json</a>
+              </div>
+            </div>
+            <div id="proto-tools-list" class="overflow-x-auto">
+              <p class="text-xs text-[var(--text-muted)] py-4">Loading live UTCP &amp; MCP tool catalog...</p>
+            </div>
+          </div>
+
+          <div class="card p-5 lg:col-span-5 space-y-3">
+            <h2 class="text-sm font-bold">Unified Hybrid Tool Runner</h2>
+            <p class="text-xs text-[var(--text-muted)]">Invoke any LedgerFlow tool through the namespaced MCP / UTCP router (<span class="mono-font">POST /api/utcp/call</span>).</p>
+            <div class="grid grid-cols-2 gap-2">
+              <div>
+                <label for="proto-select" class="block text-xs text-[var(--text-muted)] mb-1">Protocol</label>
+                <select id="proto-select" class="input-field w-full px-2.5 py-2 text-xs mono-font">
+                  <option value="utcp">utcp__ledgerflow__*</option>
+                  <option value="mcp">mcp__ledgerflow__*</option>
+                </select>
+              </div>
+              <div>
+                <label for="proto-tool-select" class="block text-xs text-[var(--text-muted)] mb-1">Tool</label>
+                <select id="proto-tool-select" class="input-field w-full px-2.5 py-2 text-xs mono-font">
+                  <option value="ledgerflow.health">ledgerflow.health</option>
+                  <option value="ledgerflow.get_summary">ledgerflow.get_summary</option>
+                  <option value="ledgerflow.list_transactions">ledgerflow.list_transactions</option>
+                  <option value="ledgerflow.get_budgets">ledgerflow.get_budgets</option>
+                  <option value="ledgerflow.generate_monthly_report">ledgerflow.generate_monthly_report</option>
+                </select>
+              </div>
+            </div>
+            <div>
+              <label for="proto-args-input" class="block text-xs text-[var(--text-muted)] mb-1">Arguments (JSON)</label>
+              <textarea id="proto-args-input" rows="3" class="input-field w-full px-3 py-2 text-xs mono-font">{}</textarea>
+            </div>
+            <button id="proto-run-btn" type="button" class="btn-primary w-full py-2 text-xs">Invoke Hybrid Tool</button>
+            <pre id="proto-output" class="surface-2 p-3 text-[11px] mono-font overflow-x-auto max-h-60 text-[var(--text)]">Ready. Select a tool and click Invoke Hybrid Tool.</pre>
+          </div>
+        </div>
+      </div>
+    `;
+
+    const listEl = document.getElementById('proto-tools-list');
+    Promise.all([
+      fetch('/utcp-manual.json').then(r => r.json()).catch(() => null),
+      fetch('/api/mcp/tools').then(r => r.json()).catch(() => null)
+    ]).then(([manual, mcp]) => {
+      if (!manual || !manual.tools) {
+        listEl.innerHTML = `<p class="text-xs text-[var(--expense)]">Unable to reach /utcp-manual.json. Ensure the server is running.</p>`;
+        return;
+      }
+      listEl.innerHTML = `
+        <table class="w-full text-left text-xs">
+          <thead>
+            <tr>
+              <th class="py-2 pr-3">UTCP Tool</th>
+              <th class="py-2 pr-3">Method</th>
+              <th class="py-2 pr-3">Endpoint</th>
+              <th class="py-2 text-right">MCP Parity</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${manual.tools.map(t => {
+              const mcpName = t.name.replace('.', '_');
+              const hasMcp = mcp && Array.isArray(mcp.tools) && mcp.tools.includes(mcpName);
+              return `
+                <tr>
+                  <td class="py-2.5 pr-3 font-medium mono-font">${escapeHtml(t.name)}</td>
+                  <td class="py-2.5 pr-3 mono-font text-[#1d5fbf]">${escapeHtml(t.tool_call_template.http_method)}</td>
+                  <td class="py-2.5 pr-3 mono-font text-[var(--text-muted)] truncate max-w-[200px]">${escapeHtml(new URL(t.tool_call_template.url).pathname)}</td>
+                  <td class="py-2.5 text-right mono-font">${hasMcp ? mcpName : '—'}</td>
+                </tr>
+              `;
+            }).join('')}
+          </tbody>
+        </table>
+      `;
+    });
+
+    document.getElementById('proto-run-btn').addEventListener('click', async () => {
+      const protocol = document.getElementById('proto-select').value;
+      const tool = document.getElementById('proto-tool-select').value;
+      const rawArgs = document.getElementById('proto-args-input').value.trim() || '{}';
+      const outEl = document.getElementById('proto-output');
+
+      let parsedArgs = {};
+      try {
+        parsedArgs = JSON.parse(rawArgs);
+      } catch (err) {
+        outEl.textContent = `Invalid JSON arguments: ${err.message}`;
+        return;
+      }
+
+      outEl.textContent = 'Invoking...';
+      try {
+        const headers = { 'Content-Type': 'application/json', 'X-Organization-ID': 'org-alex-wealth-01' };
+        if (STORE.authToken) headers['Authorization'] = `Bearer ${STORE.authToken}`;
+        const res = await fetch('/api/utcp/call', {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({ protocol, tool, arguments: parsedArgs })
+        });
+        const data = await res.json();
+        outEl.textContent = JSON.stringify(data, null, 2);
+      } catch (err) {
+        outEl.textContent = `Error: ${err.message}`;
+      }
+    });
+  }
+
+  // ---- VIEW 7C: BACKUP & RECOVERY DASHBOARD (5-DAY VAULT + MERGE RESTORE) ----
+  function renderBackups(root) {
+    const ws = getActiveWorkspace();
+    sweepWorkspaceBackups(ws);
+    const backups = ws.backups || [];
+    const resets = ws.resetEvents || [];
+    const restores = ws.restoreEvents || [];
+    const currentBalancePaise = ws.accounts.reduce((s, a) => s + calcAccountBalance(a, ws.transactions), 0);
+    const prevReset = resets[0];
+    const previousBalancePaise = prevReset ? prevReset.previousBalancePaise : currentBalancePaise;
+
+    const availableCount = backups.filter(b => b.status === 'ACTIVE' || b.status === 'EXPIRING_SOON').length;
+    const expiringCount = backups.filter(b => b.status === 'EXPIRING_SOON').length;
+    const expiredCount = backups.filter(b => b.status === 'EXPIRED').length;
+    const restoredCount = backups.filter(b => b.status === 'RESTORED' || b.mergedAt).length;
+
+    root.innerHTML = `
+      <div class="view-section space-y-5">
+        <div class="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <h1 class="text-2xl font-bold tracking-tight">Backup &amp; Recovery</h1>
+            <p class="text-xs text-[var(--text-muted)]">Encrypted 5-day retention vault · Duplicate-proof Merge Restore &amp; Audit Trail</p>
+          </div>
+          <div class="flex flex-wrap items-center gap-2">
+            <button id="bkp-create-manual" type="button" class="btn-secondary px-3.5 py-2 text-xs flex items-center gap-1.5">
+              <i data-lucide="camera" class="w-3.5 h-3.5"></i>Create Snapshot
+            </button>
+            <button id="bkp-open-reset" type="button" class="btn-danger-glass px-3.5 py-2 text-xs flex items-center gap-1.5">
+              <i data-lucide="rotate-ccw" class="w-3.5 h-3.5"></i>Smart Reset Balances
+            </button>
+          </div>
+        </div>
+
+        <!-- Admin Backup KPI Grid -->
+        <div class="grid sm:grid-cols-2 lg:grid-cols-6 gap-3">
+          <div class="card p-4">
+            <p class="text-xs text-[var(--text-muted)]">Total Backups</p>
+            <p class="text-2xl font-bold tabular-nums mt-1">${backups.length}</p>
+          </div>
+          <div class="card p-4">
+            <p class="text-xs text-[var(--text-muted)]">Available (5d)</p>
+            <p class="text-2xl font-bold tabular-nums text-[var(--income)] mt-1">${availableCount}</p>
+          </div>
+          <div class="card p-4">
+            <p class="text-xs text-[var(--text-muted)]">Expiring (&lt;24h)</p>
+            <p class="text-2xl font-bold tabular-nums text-[var(--warning)] mt-1">${expiringCount}</p>
+          </div>
+          <div class="card p-4">
+            <p class="text-xs text-[var(--text-muted)]">Expired</p>
+            <p class="text-2xl font-bold tabular-nums text-[var(--text-muted)] mt-1">${expiredCount}</p>
+          </div>
+          <div class="card p-4">
+            <p class="text-xs text-[var(--text-muted)]">Current Balance</p>
+            <p class="text-lg font-bold tabular-nums mt-1">${fmtMoney(currentBalancePaise)}</p>
+          </div>
+          <div class="card p-4">
+            <p class="text-xs text-[var(--text-muted)]">Pre-Reset Balance</p>
+            <p class="text-lg font-bold tabular-nums text-[var(--accent-blue)] mt-1">${fmtMoney(previousBalancePaise)}</p>
+          </div>
+        </div>
+
+        <!-- Backup Analytics Chart + Comparison Summary -->
+        <div class="grid lg:grid-cols-12 gap-4">
+          <div class="card p-5 lg:col-span-7 space-y-3">
+            <div class="flex items-center justify-between">
+              <h2 class="text-sm font-bold">Balance Comparison &amp; Backup Lifecycle</h2>
+              <span class="text-xs text-[var(--text-muted)]">${restoredCount} restored/merged</span>
+            </div>
+            <div class="h-52"><canvas id="bkp-lifecycle-chart"></canvas></div>
+          </div>
+          <div class="card p-5 lg:col-span-5 space-y-3">
+            <h2 class="text-sm font-bold">Security &amp; Retention Policy</h2>
+            <div class="space-y-2 text-xs">
+              <div class="surface-2 p-3 flex items-center justify-between">
+                <span class="text-[var(--text-muted)]">Encryption</span>
+                <span class="mono-font font-semibold">AES-256-GCM + SHA-256</span>
+              </div>
+              <div class="surface-2 p-3 flex items-center justify-between">
+                <span class="text-[var(--text-muted)]">Retention Window</span>
+                <span class="mono-font font-semibold">Exactly 5 Days (120h)</span>
+              </div>
+              <div class="surface-2 p-3 flex items-center justify-between">
+                <span class="text-[var(--text-muted)]">Duplicate Guard</span>
+                <span class="font-semibold text-[var(--income)]">Unique Tx ID + Merge Lock</span>
+              </div>
+              <div class="surface-2 p-3 flex items-center justify-between">
+                <span class="text-[var(--text-muted)]">Historical Records on Reset</span>
+                <span class="font-semibold">100% Preserved</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- 5-Day Backup History Table -->
+        <div class="card p-5 space-y-3">
+          <div class="flex items-center justify-between">
+            <h2 class="text-sm font-bold">5-Day Backup History</h2>
+            <span class="text-xs text-[var(--text-muted)]">Server-side &amp; local verified timestamps</span>
+          </div>
+          ${backups.length ? `
+            <div class="overflow-x-auto">
+              <table class="w-full text-left text-xs">
+                <thead>
+                  <tr>
+                    <th class="py-2.5 pr-3">Backup ID</th>
+                    <th class="py-2.5 pr-3">Reset Date &amp; Time</th>
+                    <th class="py-2.5 pr-3 text-right">Previous Financial Totals</th>
+                    <th class="py-2.5 pr-3">Status</th>
+                    <th class="py-2.5 pr-3">5-Day Expiration Countdown</th>
+                    <th class="py-2.5 text-right">Actions</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  ${backups.map(b => {
+                    const cd = formatBackupCountdown(b.expiresAt);
+                    const dt = new Date(b.createdAt);
+                    const statusClass =
+                      b.status === 'ACTIVE' ? 'bg-[var(--pill-positive-bg)] text-[var(--pill-positive-ink)]' :
+                      b.status === 'EXPIRING_SOON' ? 'bg-[var(--pill-warning-bg)] text-[var(--pill-warning-ink)]' :
+                      b.status === 'RESTORED' ? 'bg-[var(--accent-soft)] text-[var(--accent-blue)]' :
+                      'bg-[var(--pill-neutral-bg)] text-[var(--pill-neutral-ink)]';
+                    const canRestore = !cd.isExpired && b.status !== 'EXPIRED' && b.status !== 'DELETED';
+                    return `
+                      <tr>
+                        <td class="py-3 pr-3 mono-font font-semibold">${escapeHtml(b.id)}<br/><span class="text-[11px] font-normal text-[var(--text-muted)]">${escapeHtml(b.triggerType)} · ${b.transactionCount} txs</span></td>
+                        <td class="py-3 pr-3 tabular-nums">${dt.toLocaleDateString('en-IN')}<br/><span class="text-[var(--text-muted)]">${dt.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' })}</span></td>
+                        <td class="py-3 pr-3 text-right tabular-nums">
+                          <span class="font-semibold">Bal: ${fmtMoney(b.previousBalancePaise)}</span><br/>
+                          <span class="text-[11px] text-[var(--text-muted)]">Inc: ${fmtMoney(b.previousIncomePaise || 0)} · Exp: ${fmtMoney(b.previousExpensePaise || 0)} · Sav: ${fmtMoney(b.previousNetSavingsPaise || 0, true)}</span>
+                        </td>
+                        <td class="py-3 pr-3"><span class="px-2 py-0.5 rounded-full font-semibold ${statusClass}">${escapeHtml(b.status)}</span></td>
+                        <td class="py-3 pr-3 text-[var(--text-muted)]">${escapeHtml(cd.label)}</td>
+                        <td class="py-3 text-right whitespace-nowrap space-x-1">
+                          ${canRestore ? `
+                            <button type="button" data-bkp-merge="${b.id}" class="btn-primary px-2.5 py-1 text-xs">Merge Restore</button>
+                            <button type="button" data-bkp-full="${b.id}" class="btn-secondary px-2.5 py-1 text-xs">Full Restore</button>
+                          ` : ''}
+                          ${b.status !== 'DELETED' ? `
+                            <button type="button" data-bkp-del="${b.id}" class="btn-danger-glass px-2 py-1 text-xs" title="Delete backup">Delete</button>
+                          ` : ''}
+                        </td>
+                      </tr>
+                    `;
+                  }).join('')}
+                </tbody>
+              </table>
+            </div>
+          ` : `
+            <div class="surface-2 p-8 text-center space-y-2">
+              <p class="font-semibold text-sm">No backups recorded yet</p>
+              <p class="text-xs text-[var(--text-muted)]">Click <strong>Smart Reset Balances</strong> or <strong>Create Snapshot</strong> to save an encrypted 5-day backup.</p>
+            </div>
+          `}
+        </div>
+
+        <!-- Reset History & Restore History -->
+        <div class="grid lg:grid-cols-2 gap-4">
+          <div class="card p-5 space-y-3">
+            <h2 class="text-sm font-bold">Reset History</h2>
+            <div class="space-y-2 max-h-60 overflow-y-auto">
+              ${resets.length ? resets.map(r => `
+                <div class="surface-2 p-3 flex items-center justify-between gap-2 text-xs">
+                  <div>
+                    <p class="font-semibold">${escapeHtml(r.scope)} (${escapeHtml(r.scopeTarget || '')})</p>
+                    <p class="text-[var(--text-muted)] mono-font">${escapeHtml(r.id)} · Backup ${escapeHtml(r.backupId)} · ${r.preservedRecordsCount} preserved</p>
+                  </div>
+                  <div class="text-right tabular-nums">
+                    <p class="font-bold text-[var(--expense)]">-${fmtMoney(r.resetAmountPaise)}</p>
+                    <p class="text-[var(--text-muted)]">${new Date(r.createdAt).toLocaleDateString('en-IN')}</p>
+                  </div>
+                </div>
+              `).join('') : `<p class="text-xs text-[var(--text-muted)]">No resets performed yet.</p>`}
+            </div>
+          </div>
+
+          <div class="card p-5 space-y-3">
+            <h2 class="text-sm font-bold">Restore &amp; Merge History</h2>
+            <div class="space-y-2 max-h-60 overflow-y-auto">
+              ${restores.length ? restores.map(r => `
+                <div class="surface-2 p-3 flex items-center justify-between gap-2 text-xs">
+                  <div>
+                    <p class="font-semibold">${escapeHtml(r.mode)} Restore · <span class="mono-font">${escapeHtml(r.backupId)}</span></p>
+                    <p class="text-[var(--text-muted)]">+${r.recoveredRecordsCount} recovered · ${r.skippedDuplicatesCount} duplicates skipped</p>
+                  </div>
+                  <div class="text-right tabular-nums">
+                    <p class="font-bold text-[var(--income)]">+${fmtMoney(r.recoveredAmountPaise)}</p>
+                    <p class="text-[var(--text-muted)]">Final: ${fmtMoney(r.finalBalancePaise)}</p>
+                  </div>
+                </div>
+              `).join('') : `<p class="text-xs text-[var(--text-muted)]">No restores executed yet.</p>`}
+            </div>
+          </div>
+        </div>
+      </div>
+    `;
+
+    // Chart.js Backup Comparison
+    const chartEl = document.getElementById('bkp-lifecycle-chart');
+    if (chartEl && window.Chart) {
+      UI.charts.backupChart = new Chart(chartEl, {
+        type: 'bar',
+        data: {
+          labels: ['Available', 'Expiring Soon', 'Restored/Merged', 'Expired'],
+          datasets: [{
+            label: 'Backups',
+            data: [availableCount, expiringCount, restoredCount, expiredCount],
+            backgroundColor: ['#059669', '#d97706', '#2563eb', '#64748b'],
+            borderRadius: 8
+          }]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          plugins: { legend: { display: false } },
+          scales: { y: { beginAtZero: true, ticks: { stepSize: 1 } } }
+        }
+      });
+    }
+
+    document.getElementById('bkp-create-manual').addEventListener('click', () => {
+      const b = createLocalBackup(ws, 'MANUAL', 'FULL', null, 0);
+      saveStore();
+      showToast(`Snapshot ${b.id} saved for 5 days`);
+      renderApp();
+    });
+    document.getElementById('bkp-open-reset').addEventListener('click', openSmartResetModal);
+
+    root.querySelectorAll('[data-bkp-merge]').forEach(btn => {
+      btn.addEventListener('click', () => openRestorePreviewModal(btn.dataset.bkpMerge, 'MERGE'));
+    });
+    root.querySelectorAll('[data-bkp-full]').forEach(btn => {
+      btn.addEventListener('click', () => openRestorePreviewModal(btn.dataset.bkpFull, 'FULL'));
+    });
+    root.querySelectorAll('[data-bkp-del]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const bId = btn.dataset.bkpDel;
+        openConfirm('Delete Backup Snapshot', `Delete ${bId}? Active backups within the 5-day retention window require explicit confirmation.`, () => {
+          const target = ws.backups.find(x => x.id === bId);
+          if (target) {
+            target.status = 'DELETED';
+            target.deletedAt = new Date().toISOString();
+            logAudit('BACKUP_DELETED', `Deleted backup ${bId}`);
+            saveStore();
+            showToast(`Backup ${bId} deleted`, 'info');
+            renderApp();
+          }
+        });
+      });
+    });
+  }
+
+  function openSmartResetModal() {
+    const ws = getActiveWorkspace();
+    const activeTxs = getActiveTxs(ws);
+    const filtered = filterByDateRange(activeTxs, UI.dateRange);
+    const totals = calcTotals(filtered);
+    const totalBal = ws.accounts.reduce((s, a) => s + calcAccountBalance(a, ws.transactions), 0);
+    const scopeSel = document.getElementById('reset-scope-select');
+    const targetWrap = document.getElementById('reset-target-wrap');
+    const targetSel = document.getElementById('reset-target-select');
+    const sumEl = document.getElementById('smart-reset-summary');
+    scopeSel.value = 'FULL';
+
+    const refreshResetPreview = () => {
+      const scope = scopeSel.value;
+      if (scope === 'FULL') {
+        targetWrap.classList.add('hidden');
+        sumEl.innerHTML = `
+          <div class="surface-2 p-3"><p class="text-[var(--text-muted)]">Current Total Balance</p><p class="text-base font-bold tabular-nums mt-0.5">${fmtMoney(totalBal)}</p></div>
+          <div class="surface-2 p-3"><p class="text-[var(--text-muted)]">Current Total Income</p><p class="text-base font-bold tabular-nums text-[var(--income)] mt-0.5">${fmtMoney(totals.income)}</p></div>
+          <div class="surface-2 p-3"><p class="text-[var(--text-muted)]">Current Total Expenses</p><p class="text-base font-bold tabular-nums text-[var(--expense)] mt-0.5">${fmtMoney(totals.expense)}</p></div>
+          <div class="surface-2 p-3"><p class="text-[var(--text-muted)]">Current Net Savings</p><p class="text-base font-bold tabular-nums mt-0.5">${fmtMoney(totals.net, true)}</p></div>
+        `;
+      } else if (scope === 'ACCOUNT') {
+        targetWrap.classList.remove('hidden');
+        if (!targetSel.dataset.mode || targetSel.dataset.mode !== 'ACCOUNT') {
+          targetSel.dataset.mode = 'ACCOUNT';
+          targetSel.innerHTML = ws.accounts.map(a => `<option value="${a.id}">${escapeHtml(a.name)} (${fmtMoney(calcAccountBalance(a, ws.transactions))})</option>`).join('');
+        }
+        const acc = ws.accounts.find(a => a.id === targetSel.value) || ws.accounts[0];
+        const accBal = acc ? calcAccountBalance(acc, ws.transactions) : 0;
+        const accTotals = calcTotals(activeTxs.filter(t => acc && t.accountId === acc.id));
+        sumEl.innerHTML = `
+          <div class="surface-2 p-3"><p class="text-[var(--text-muted)]">Account Balance</p><p class="text-base font-bold tabular-nums mt-0.5">${fmtMoney(accBal)}</p></div>
+          <div class="surface-2 p-3"><p class="text-[var(--text-muted)]">Account Income</p><p class="text-base font-bold tabular-nums text-[var(--income)] mt-0.5">${fmtMoney(accTotals.income)}</p></div>
+          <div class="surface-2 p-3"><p class="text-[var(--text-muted)]">Account Expenses</p><p class="text-base font-bold tabular-nums text-[var(--expense)] mt-0.5">${fmtMoney(accTotals.expense)}</p></div>
+          <div class="surface-2 p-3"><p class="text-[var(--text-muted)]">Account Net Savings</p><p class="text-base font-bold tabular-nums mt-0.5">${fmtMoney(accTotals.net, true)}</p></div>
+        `;
+      } else {
+        targetWrap.classList.remove('hidden');
+        if (!targetSel.dataset.mode || targetSel.dataset.mode !== 'CATEGORY') {
+          targetSel.dataset.mode = 'CATEGORY';
+          const cats = [...new Set(activeTxs.map(t => t.category))];
+          targetSel.innerHTML = (cats.length ? cats : ['Food']).map(c => `<option value="${escapeHtml(c)}">${escapeHtml(c)}</option>`).join('');
+        }
+        const cat = targetSel.value;
+        const catTotals = calcTotals(activeTxs.filter(t => t.category === cat));
+        sumEl.innerHTML = `
+          <div class="surface-2 p-3"><p class="text-[var(--text-muted)]">Category</p><p class="text-base font-bold truncate mt-0.5">${escapeHtml(cat)}</p></div>
+          <div class="surface-2 p-3"><p class="text-[var(--text-muted)]">Category Income</p><p class="text-base font-bold tabular-nums text-[var(--income)] mt-0.5">${fmtMoney(catTotals.income)}</p></div>
+          <div class="surface-2 p-3"><p class="text-[var(--text-muted)]">Category Expenses</p><p class="text-base font-bold tabular-nums text-[var(--expense)] mt-0.5">${fmtMoney(catTotals.expense)}</p></div>
+          <div class="surface-2 p-3"><p class="text-[var(--text-muted)]">Net Impact</p><p class="text-base font-bold tabular-nums mt-0.5">${fmtMoney(catTotals.net, true)}</p></div>
+        `;
+      }
+    };
+
+    scopeSel.onchange = refreshResetPreview;
+    targetSel.onchange = refreshResetPreview;
+    refreshResetPreview();
+    document.getElementById('smart-reset-modal').classList.remove('hidden');
+    if (window.lucide) lucide.createIcons();
+  }
+
+  function openRestorePreviewModal(backupId, mode) {
+    const ws = getActiveWorkspace();
+    const bodyEl = document.getElementById('restore-preview-body');
+    const titleEl = document.getElementById('restore-modal-title');
+    const subEl = document.getElementById('restore-modal-sub');
+    const confirmBtn = document.getElementById('restore-modal-confirm');
+
+    try {
+      if (mode === 'MERGE') {
+        const preview = previewLocalMergeRestore(backupId);
+        titleEl.textContent = 'Smart Merge Restore Preview';
+        subEl.textContent = `Backup ${backupId} · Duplicate-proof incremental recovery`;
+        bodyEl.innerHTML = `
+          <div class="surface-2 p-3.5 space-y-2">
+            <div class="flex justify-between"><span>Current Balance</span><strong class="tabular-nums">${fmtMoney(preview.currentBalancePaise)}</strong></div>
+            <div class="flex justify-between"><span>Backup Balance</span><strong class="tabular-nums">${fmtMoney(preview.backupBalancePaise)}</strong></div>
+            <div class="flex justify-between"><span>New Records to Recover</span><strong class="tabular-nums">${preview.newRecordsToRecover}</strong></div>
+            <div class="flex justify-between"><span>Duplicate Records Skipped</span><strong class="tabular-nums text-[var(--warning)]">${preview.duplicateRecordsSkipped}</strong></div>
+            <div class="flex justify-between pt-2 border-t border-[var(--border-subtle)]">
+              <span>Eligible Recovered Amount</span>
+              <strong class="tabular-nums text-[var(--income)]">+${fmtMoney(preview.eligibleRecoveredPaise)}</strong>
+            </div>
+            <div class="flex justify-between text-sm">
+              <span class="font-bold">Final Projected Balance</span>
+              <strong class="tabular-nums text-[var(--accent-blue)]">${fmtMoney(preview.finalProjectedBalancePaise)}</strong>
+            </div>
+          </div>
+          ${preview.alreadyMerged ? `<p class="text-[var(--expense)] font-medium">Notice: This backup has already been merged into this workspace. Repeated merging is blocked to prevent duplicate balance inflation.</p>` : `<p class="text-[var(--text-muted)]">A pre-restore safety snapshot will be created automatically before merging.</p>`}
+        `;
+        confirmBtn.disabled = preview.alreadyMerged && preview.newRecordsToRecover === 0;
+        confirmBtn.onclick = () => {
+          try {
+            const res = executeLocalMergeRestore(backupId);
+            document.getElementById('restore-preview-modal').classList.add('hidden');
+            showToast(`Merge Restore complete! Final balance: ${fmtMoney(res.finalBalancePaise)}`);
+            renderApp();
+          } catch (e) {
+            showToast(e.message, 'error');
+          }
+        };
+      } else {
+        const b = ws.backups.find(x => x.id === backupId);
+        if (!b) throw new Error('Backup not found');
+        const curBal = ws.accounts.reduce((s, a) => s + calcAccountBalance(a, ws.transactions), 0);
+        titleEl.textContent = 'Full Snapshot Restore Preview';
+        subEl.textContent = `Backup ${backupId} · Replaces current state with snapshot`;
+        bodyEl.innerHTML = `
+          <div class="surface-2 p-3.5 space-y-2">
+            <div class="flex justify-between"><span>Current Balance</span><strong class="tabular-nums">${fmtMoney(curBal)}</strong></div>
+            <div class="flex justify-between"><span>Snapshot Balance</span><strong class="tabular-nums text-[var(--accent-blue)]">${fmtMoney(b.previousBalancePaise)}</strong></div>
+            <div class="flex justify-between"><span>Snapshot Records</span><strong class="tabular-nums">${b.transactionCount} transactions</strong></div>
+          </div>
+          <p class="text-[var(--text-muted)]">A pre-restore safety snapshot will be saved automatically before restoring.</p>
+        `;
+        confirmBtn.disabled = false;
+        confirmBtn.onclick = () => {
+          try {
+            executeLocalFullRestore(backupId);
+            document.getElementById('restore-preview-modal').classList.add('hidden');
+            showToast(`Full Restore complete from ${backupId}`);
+            renderApp();
+          } catch (e) {
+            showToast(e.message, 'error');
+          }
+        };
+      }
+      document.getElementById('restore-preview-modal').classList.remove('hidden');
+      if (window.lucide) lucide.createIcons();
+    } catch (err) {
+      showToast(err.message, 'error');
+    }
+  }
+
   // ---- VIEW 8: WORKSPACE ADMIN ----
   function renderAdmin(root) {
     const ws = getActiveWorkspace();
@@ -1905,7 +2827,7 @@
           <div class="card p-5 lg:col-span-5 space-y-3">
             <div class="flex items-center justify-between">
               <h3 class="text-sm font-bold">Registered Local Accounts</h3>
-              <button id="admin-switch-btn" type="button" class="text-xs font-semibold text-[#C6A66B] hover:text-[#C6A66B]">Switch / Add →</button>
+              <button id="admin-switch-btn" type="button" class="text-xs font-semibold text-[#1d5fbf] hover:text-[#1d5fbf]">Switch / Add →</button>
             </div>
             <div class="space-y-2.5">
               ${userList.map(u => {
@@ -1917,7 +2839,7 @@
                       <p class="text-xs font-semibold truncate">${escapeHtml(u.name)}</p>
                       <p class="text-[11px] text-[var(--text-muted)] truncate">${escapeHtml(u.email)} · ${uWs ? uWs.transactions.length : 0} txs</p>
                     </div>
-                    <span class="px-2 py-0.5 rounded-full text-[10px] font-semibold ${isActive ? 'bg-emerald-500/20 text-[#16A579]' : 'bg-slate-500/20 text-[var(--text-muted)]'}">${isActive ? 'Active' : 'Isolated'}</span>
+                    <span class="px-2 py-0.5 rounded-full text-xs font-semibold ${isActive ? 'bg-emerald-500/20 text-[#16A579]' : 'bg-slate-500/20 text-[var(--text-muted)]'}">${isActive ? 'Active' : 'Isolated'}</span>
                   </div>
                 `;
               }).join('')}
@@ -1930,7 +2852,7 @@
               ${ws.auditLogs.length ? ws.auditLogs.map(l => `
                 <div class="surface-2 px-3.5 py-2.5 rounded-xl flex items-center justify-between gap-3 text-xs">
                   <div class="flex items-center gap-2.5 min-w-0">
-                    <span class="px-2 py-0.5 rounded-md bg-[#C6A66B]/15 text-[#C6A66B] font-mono text-[10px] shrink-0">${escapeHtml(l.action)}</span>
+                    <span class="px-2 py-0.5 rounded-md bg-[#C6A66B]/15 text-[#1d5fbf] font-mono text-xs shrink-0">${escapeHtml(l.action)}</span>
                     <span class="truncate text-[var(--text)]">${escapeHtml(l.detail)}</span>
                   </div>
                   <span class="text-[11px] text-[var(--text-muted)] tabular-nums shrink-0">${escapeHtml(l.time)}</span>
@@ -2173,7 +3095,7 @@
         <div class="min-w-0">
           <p class="text-xs font-semibold">${escapeHtml(n.title)}</p>
           <p class="text-[11px] text-[var(--text-muted)] mt-0.5 leading-relaxed">${escapeHtml(n.message)}</p>
-          <p class="text-[10px] text-[var(--text-muted)] mt-1">${escapeHtml(n.time)}</p>
+          <p class="text-xs text-[var(--text-muted)] mt-1">${escapeHtml(n.time)}</p>
         </div>
         <button type="button" data-dismiss-notif="${n.id}" class="p-1 text-[var(--text-muted)] hover:text-[#D96C72]" aria-label="Dismiss"><i data-lucide="x" class="w-3.5 h-3.5"></i></button>
       </div>
@@ -2233,6 +3155,15 @@
     document.getElementById('mobile-brand-btn').addEventListener('click', openLanding);
     document.getElementById('landing-launch-btn').addEventListener('click', launchApp);
     document.getElementById('landing-cta-primary').addEventListener('click', launchApp);
+    const heroLearnMore = document.getElementById('hero-learn-more');
+    if (heroLearnMore) {
+      heroLearnMore.addEventListener('click', () => {
+        STORE.showLanding = false;
+        UI.view = 'protocols';
+        saveStore();
+        renderApp();
+      });
+    }
     document.getElementById('landing-signin-btn').addEventListener('click', () => { setAuthMode('login'); document.getElementById('auth-modal').classList.remove('hidden'); });
     document.getElementById('landing-cta-register').addEventListener('click', () => { setAuthMode('register'); document.getElementById('auth-modal').classList.remove('hidden'); });
 
@@ -2246,6 +3177,28 @@
     document.getElementById('landing-theme-btn').addEventListener('click', toggleTheme);
 
     document.getElementById('quick-add-btn').addEventListener('click', () => openTxModal());
+    const headerResetBtn = document.getElementById('header-reset-btn');
+    if (headerResetBtn) headerResetBtn.addEventListener('click', openSmartResetModal);
+
+    const closeResetModal = () => document.getElementById('smart-reset-modal').classList.add('hidden');
+    document.getElementById('smart-reset-close').addEventListener('click', closeResetModal);
+    document.getElementById('smart-reset-cancel').addEventListener('click', closeResetModal);
+    document.getElementById('smart-reset-confirm').addEventListener('click', () => {
+      const scope = document.getElementById('reset-scope-select').value;
+      const target = scope === 'FULL' ? null : document.getElementById('reset-target-select').value;
+      try {
+        const res = performSmartReset(scope, target);
+        closeResetModal();
+        showToast(`Dashboard reset to ₹0. Backup ${res.backup.id} saved for 5 days.`);
+        renderApp();
+      } catch (err) {
+        showToast(err.message, 'error');
+      }
+    });
+
+    const closeRestoreModal = () => document.getElementById('restore-preview-modal').classList.add('hidden');
+    document.getElementById('restore-modal-close').addEventListener('click', closeRestoreModal);
+    document.getElementById('restore-modal-cancel').addEventListener('click', closeRestoreModal);
     document.getElementById('tx-modal-close').addEventListener('click', closeTxModal);
     document.getElementById('tx-cancel-btn').addEventListener('click', closeTxModal);
     document.querySelectorAll('.tx-type-btn').forEach(btn => {
@@ -2469,6 +3422,8 @@
         closeTxModal();
         closeConfirm();
         closeRepModal();
+        closeResetModal();
+        closeRestoreModal();
         document.getElementById('notif-drawer').classList.add('hidden');
         document.getElementById('auth-modal').classList.add('hidden');
         document.getElementById('mobile-more-modal').classList.add('hidden');
