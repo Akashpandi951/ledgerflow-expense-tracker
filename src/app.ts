@@ -170,6 +170,8 @@ export function createApp(customInstanceId?: string): Express {
     path.resolve(process.cwd(), 'dist'),
     process.cwd(),
     path.resolve(__dirname, '../public'),
+    path.resolve(__dirname, '../../public'),
+    path.resolve(__dirname, '..'),
     path.resolve(__dirname, '../ledgerflow_expense_tracker/modular'),
     path.resolve(__dirname, './public')
   ];
@@ -198,3 +200,6 @@ export function createApp(customInstanceId?: string): Express {
 
   return app;
 }
+
+const defaultApp = createApp(process.env.VERCEL ? 'vercel-serverless' : undefined);
+export default defaultApp;
